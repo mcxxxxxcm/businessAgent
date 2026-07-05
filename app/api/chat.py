@@ -1,0 +1,184 @@
+"""SSE流式聊天接口"""
+
+import json
+import uuid
+import logging
+from collections.abc import AsyncGenerator
+
+from fastapi import APIRouter, Depends
+from sse_starlette.sse import EventSourceResponse
+from langchain_core.messages import HumanMessage
+
+from app.models.schemas import ChatRequest, ChatResponse
+from app.memory.cache import SessionCache
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/v1", tags=["chat"])
+
+
+@router.post("/chat/stream")
+async def chat_stream(request: ChatRequest) -> EventSourceResponse:
+    """SSE流式聊天接口 - 逐Token输出Agent响应"""
+
+    async def event_generator() -> AsyncGenerator[dict, None]:
+        from app.api.deps import get_graph
+
+        try:
+            graph = await get_graph()
+        except Exception as e:
+            logger.error("获取Graph实例失败: %s", e)
+            yield {
+                "event": "error",
+                "data": json.dumps({"error": "服务暂时不可用，请稍后重试"}, ensure_ascii=False),
+            }
+            return
+
+        session_id = request.session_id or str(uuid.uuid4())
+        config = {
+            "configurable": {
+                "thread_id": session_id,
+            }
+        }
+
+        input_data = {
+            "messages": [HumanMessage(content=request.message)],
+            "user_id": request.user_id,
+            "session_id": session_id,
+            "turn_count": 0,
+            "max_turns": 20,
+            "needs_escalation": False,
+        }
+
+        # 更新用户在线状态
+        await SessionCache.set_user_online(request.user_id, session_id)
+
+        # 发送会话信息
+        yield {
+            "event": "session",
+            "data": json.dumps({"session_id": session_id, "user_id": request.user_id}, ensure_ascii=False),
+        }
+
+        try:
+            # 使用astream_events v3 API获取Token级流式输出
+            async for event in graph.astream_events(
+                input_data,
+                config=config,
+                version="v2",
+            ):
+                kind = event.get("event")
+
+                # LLM生成Token
+                if kind == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    if hasattr(chunk, "content") and chunk.content:
+                        # 只输出文本Token，过滤工具调用
+                        if isinstance(chunk.content, str):
+                            yield {
+                                "event": "token",
+                                "data": json.dumps({"content": chunk.content}, ensure_ascii=False),
+                            }
+
+                # 工具调用开始
+                elif kind == "on_tool_start":
+                    tool_name = event.get("name", "unknown")
+                    yield {
+                        "event": "tool_start",
+                        "data": json.dumps(
+                            {"tool": tool_name, "message": f"正在调用 {tool_name}..."},
+                            ensure_ascii=False,
+                        ),
+                    }
+
+                # 工具调用完成
+                elif kind == "on_tool_end":
+                    tool_name = event.get("name", "unknown")
+                    yield {
+                        "event": "tool_end",
+                        "data": json.dumps({"tool": tool_name, "status": "completed"}, ensure_ascii=False),
+                    }
+
+                # 节点执行
+                elif kind == "on_chain_start":
+                    node_name = event.get("name", "")
+                    tracked_nodes = {
+                        "intent_router",
+                        "order_agent",
+                        "product_agent",
+                        "refund_agent",
+                        "knowledge_agent",
+                        "escalation",
+                        "response",
+                    }
+                    if node_name in tracked_nodes:
+                        yield {
+                            "event": "node_start",
+                            "data": json.dumps({"node": node_name}, ensure_ascii=False),
+                        }
+
+        except Exception as e:
+            logger.error("流式生成失败: %s", e)
+            yield {
+                "event": "error",
+                "data": json.dumps({"error": f"生成回复时出错: {str(e)}"}, ensure_ascii=False),
+            }
+
+        # 流结束
+        yield {
+            "event": "done",
+            "data": json.dumps({"session_id": session_id}, ensure_ascii=False),
+        }
+
+    return EventSourceResponse(event_generator())
+
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat_sync(request: ChatRequest) -> ChatResponse:
+    """非流式聊天接口 - 适用于不支持SSE的客户端"""
+    from app.api.deps import get_graph
+
+    try:
+        graph = await get_graph()
+    except Exception as e:
+        logger.error("获取Graph实例失败: %s", e)
+        raise
+
+    session_id = request.session_id or str(uuid.uuid4())
+    config = {
+        "configurable": {
+            "thread_id": session_id,
+        }
+    }
+
+    input_data = {
+        "messages": [HumanMessage(content=request.message)],
+        "user_id": request.user_id,
+        "session_id": session_id,
+        "turn_count": 0,
+        "max_turns": 20,
+        "needs_escalation": False,
+    }
+
+    # 更新用户在线状态
+    await SessionCache.set_user_online(request.user_id, session_id)
+
+    try:
+        result = await graph.ainvoke(input_data, config=config)
+    except Exception as e:
+        logger.error("同步调用失败: %s", e)
+        raise
+
+    # 提取最后一条AI消息
+    last_ai_msg = ""
+    for msg in reversed(result.get("messages", [])):
+        if hasattr(msg, "type") and msg.type == "ai":
+            last_ai_msg = msg.content
+            break
+
+    return ChatResponse(
+        session_id=session_id,
+        reply=last_ai_msg,
+        intent=result.get("intent"),
+        sentiment=result.get("sentiment"),
+        needs_escalation=result.get("needs_escalation", False),
+    )
