@@ -9,8 +9,12 @@ from contextlib import asynccontextmanager
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from app.core.config import settings
 from app.core.logging import setup_logging
@@ -56,6 +60,16 @@ app.include_router(health_router)
 app.include_router(chat_router)
 app.include_router(sessions_router)
 
+# 静态文件
+STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/")
+async def index():
+    """前端首页"""
+    return FileResponse(STATIC_DIR / "index.html")
+
 
 # 全局异常处理
 @app.exception_handler(AgentError)
@@ -86,4 +100,15 @@ async def generic_error_handler(request, exc: Exception):
     return JSONResponse(
         status_code=500,
         content={"error": {"code": "INTERNAL_ERROR", "message": "服务器内部错误"}},
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
     )
