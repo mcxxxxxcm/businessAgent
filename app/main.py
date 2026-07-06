@@ -1,7 +1,13 @@
 """FastAPI应用入口"""
 
+import sys
+import asyncio
 import logging
 from contextlib import asynccontextmanager
+
+# Windows兼容: psycopg异步模式需要SelectorEventLoop
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
