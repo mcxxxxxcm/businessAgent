@@ -28,4 +28,4 @@ async def order_agent_node(state: CustomerServiceState) -> dict:
             ]
         )
 
-    return {"messages": [response]}
+    return {"messages": [response], "active_agent": "order_agent"}

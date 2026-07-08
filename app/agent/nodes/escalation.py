@@ -31,4 +31,4 @@ async def escalation_node(state: CustomerServiceState) -> dict:
             ]
         )
 
-    return {"messages": [response]}
+    return {"messages": [response], "active_agent": "escalation"}

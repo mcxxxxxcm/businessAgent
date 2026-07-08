@@ -27,4 +27,4 @@ async def knowledge_agent_node(state: CustomerServiceState) -> dict:
             ]
         )
 
-    return {"messages": [response]}
+    return {"messages": [response], "active_agent": "knowledge_agent"}

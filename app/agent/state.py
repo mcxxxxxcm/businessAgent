@@ -1,6 +1,6 @@
 """Agent状态定义 - 所有节点共享的数据结构"""
 
-from typing import TypedDict, Annotated, Literal, Optional
+from typing import TypedDict, Annotated, Literal, Optional, Any
 
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
@@ -40,6 +40,16 @@ class CustomerServiceState(TypedDict):
     needs_escalation: bool
     escalation_reason: Optional[str]
 
-    # 循环防护
-    turn_count: int  # 当前对话轮次
-    max_turns: int  # 最大轮次(防无限循环)
+    # 当前活跃的子Agent(用于ReAct循环: tool_executor路由回对应的子Agent)
+    active_agent: Optional[str]  # "order_agent" | "product_agent" | "refund_agent" | "knowledge_agent" | "escalation"
+
+    # === 记忆相关字段 ===
+
+    # 当前会话的对话摘要(增量摘要，Context Compression核心)
+    conversation_summary: str
+
+    # 用户画像(从长期记忆加载，注入prompt)
+    user_profile: Optional[dict]
+
+    # 历史会话摘要(跨会话上下文)
+    history_summary: str

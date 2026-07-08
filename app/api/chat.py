@@ -48,6 +48,10 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
             "turn_count": 0,
             "max_turns": 20,
             "needs_escalation": False,
+            "active_agent": None,
+            "conversation_summary": "",
+            "user_profile": None,
+            "history_summary": "",
         }
 
         # 更新用户在线状态
@@ -157,6 +161,10 @@ async def chat_sync(request: ChatRequest) -> ChatResponse:
         "turn_count": 0,
         "max_turns": 20,
         "needs_escalation": False,
+        "active_agent": None,
+        "conversation_summary": "",
+        "user_profile": None,
+        "history_summary": "",
     }
 
     # 更新用户在线状态
