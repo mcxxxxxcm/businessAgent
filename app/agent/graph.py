@@ -20,6 +20,8 @@ from app.tools.product_search import search_products, check_inventory
 from app.tools.refund import create_refund, create_service_ticket, query_refund_status
 from app.tools.knowledge_rag import search_knowledge_base
 from app.tools.human_escalation import transfer_to_human
+from app.tools.phone_call import place_phone_call
+from app.tools.sms import send_order_notification, send_refund_notification, send_custom_sms
 
 ALL_TOOLS = [
     query_order,
@@ -31,6 +33,10 @@ ALL_TOOLS = [
     query_refund_status,
     search_knowledge_base,
     transfer_to_human,
+    place_phone_call,
+    send_order_notification,
+    send_refund_notification,
+    send_custom_sms,
 ]
 
 # 可路由回的子Agent列表

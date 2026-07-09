@@ -5,14 +5,15 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from app.agent.state import CustomerServiceState
 from app.agent.prompts import ORDER_AGENT_PROMPT
 from app.tools.order_query import query_order, track_logistics
+from app.tools.sms import send_order_notification
 
 
 async def order_agent_node(state: CustomerServiceState) -> dict:
-    """订单查询Agent - 绑定query_order和track_logistics工具"""
+    """订单查询Agent - 绑定query_order、track_logistics和send_order_notification工具"""
     from app.api.deps import get_llm, llm_semaphore
 
     llm = get_llm()
-    order_llm = llm.bind_tools([query_order, track_logistics])
+    order_llm = llm.bind_tools([query_order, track_logistics, send_order_notification])
 
     # 格式化system prompt
     system_content = ORDER_AGENT_PROMPT.format(

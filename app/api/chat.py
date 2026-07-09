@@ -72,11 +72,15 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
             ):
                 kind = event.get("event")
 
-                # LLM生成Token
+                # LLM生成Token — 过滤内部调用(意图路由JSON等)，只放行用户可见的回复
                 if kind == "on_chat_model_stream":
+                    tags = event.get("tags", [])
+                    # 排除标记为internal的LLM调用(意图路由等)
+                    if "internal" in tags:
+                        continue
+
                     chunk = event["data"]["chunk"]
                     if hasattr(chunk, "content") and chunk.content:
-                        # 只输出文本Token，过滤工具调用
                         if isinstance(chunk.content, str):
                             yield {
                                 "event": "token",

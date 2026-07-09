@@ -22,6 +22,7 @@ from app.core.exceptions import AgentError
 from app.api.health import router as health_router
 from app.api.chat import router as chat_router
 from app.api.sessions import router as sessions_router
+from app.api.outbound import router as outbound_router
 from app.api.middleware import RateLimitMiddleware, setup_cors
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,26 @@ async def lifespan(app: FastAPI):
     setup_logging(debug=settings.DEBUG)
     logger.info("启动 %s v%s", settings.APP_NAME, settings.APP_VERSION)
 
-    # 启动时初始化连接
+    # 启动时预初始化连接池和Graph，避免首次请求超时
+    try:
+        from app.core.postgres import get_pg_pool
+        from app.core.redis import get_redis
+
+        # 先初始化PG连接池
+        await get_pg_pool()
+        logger.info("PG连接池初始化完成")
+
+        # 初始化Redis
+        await get_redis()
+        logger.info("Redis初始化完成")
+
+        # 预编译Graph(包含checkpointer和store的setup)
+        from app.api.deps import get_graph
+        await get_graph()
+        logger.info("Agent Graph初始化完成")
+    except Exception as e:
+        logger.warning("预初始化失败(将在首次请求时重试): %s", e)
+
     yield
 
     # 关闭时清理资源
@@ -59,6 +79,7 @@ app.add_middleware(RateLimitMiddleware)
 app.include_router(health_router)
 app.include_router(chat_router)
 app.include_router(sessions_router)
+app.include_router(outbound_router)
 
 # 静态文件
 STATIC_DIR = Path(__file__).parent / "static"

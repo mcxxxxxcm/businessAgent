@@ -120,11 +120,13 @@ async def intent_router_node(state: CustomerServiceState, *, store: BaseStore) -
 
     try:
         # 直接用普通LLM调用，要求返回JSON
+        # tags=["internal"] 标记为内部调用，SSE流不过滤给前端
         response = await llm.ainvoke(
             [
                 SystemMessage(content=system_prompt),
                 *recent_messages,
-            ]
+            ],
+            config={"tags": ["internal"]},
         )
 
         result = _parse_json_response(response.content)

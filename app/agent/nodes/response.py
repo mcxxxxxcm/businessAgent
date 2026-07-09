@@ -61,7 +61,8 @@ async def response_node(state: CustomerServiceState, *, store: BaseStore) -> dic
             [
                 SystemMessage(content=system_content),
                 *state["messages"][-10:],  # 最近10条消息
-            ]
+            ],
+            config={"tags": ["response"]},  # 标记为response节点输出，SSE只放行此tag
         )
 
     # 保存长期记忆

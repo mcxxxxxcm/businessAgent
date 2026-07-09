@@ -13,6 +13,9 @@ llm_semaphore = asyncio.Semaphore(5)
 # 图实例缓存
 _graph_instance = None
 
+# 外呼管理器缓存
+_outbound_manager = None
+
 
 @lru_cache
 def get_llm() -> ChatOpenAI:
@@ -45,3 +48,27 @@ async def get_graph():
     store = await get_store()
     _graph_instance = await compile_graph(checkpointer, store)
     return _graph_instance
+
+
+async def get_outbound_manager():
+    """获取外呼管理器(单例)"""
+    global _outbound_manager
+    if _outbound_manager is not None:
+        return _outbound_manager
+
+    from app.voice.outbound import OutboundManager
+
+    _outbound_manager = OutboundManager(
+        freeswitch_host="127.0.0.1",
+        freeswitch_esl_port=8021,
+        freeswitch_esl_password="ClueCon",
+        gateway_ws_url="ws://127.0.0.1:8765",
+    )
+
+    # 尝试连接FreeSWITCH ESL (连接失败也不影响启动)
+    try:
+        await _outbound_manager.connect_esl()
+    except Exception:
+        pass  # 降级为模拟模式
+
+    return _outbound_manager

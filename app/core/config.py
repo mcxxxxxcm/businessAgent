@@ -31,6 +31,19 @@ class Settings(BaseSettings):
     LANGCHAIN_API_KEY: str | None = None
     LANGCHAIN_PROJECT: str = "cs-agent"
 
+    # === 短信服务 ===
+    SMS_PROVIDER: str = "dummy"  # aliyun / tencent / dummy(模拟)
+    SMS_SIGN_NAME: str = "智能优选"  # 短信签名，需在平台审核
+    # 阿里云短信
+    ALIYUN_ACCESS_KEY_ID: str = ""
+    ALIYUN_ACCESS_KEY_SECRET: str = ""
+    # 腾讯云短信
+    TENCENT_SECRET_ID: str = ""
+    TENCENT_SECRET_KEY: str = ""
+    TENCENT_SMS_APP_ID: str = ""
+    # 通用
+    SMS_DRY_RUN: bool = True  # True=只打印不实际发送(开发模式)
+
     # === 应用 ===
     APP_NAME: str = "智能客服Agent"
     APP_VERSION: str = "1.0.0"
