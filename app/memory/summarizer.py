@@ -5,6 +5,8 @@
 - 摘要采用增量方式：已有摘要 + 新消息 → 扩展摘要
 - 删除已摘要的旧消息，保留最近N条 + 摘要
 - 摘要保存到PG Store用于跨会话检索
+
+结构化输出: 使用ConversationSummary Pydantic模型 + structured_llm_output四层降级链
 """
 
 import logging
@@ -20,6 +22,7 @@ from langchain_core.messages import (
 from langgraph.store.base import BaseStore
 
 from app.agent.state import CustomerServiceState
+from app.agent.schemas import ConversationSummary, structured_llm_output
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +82,7 @@ async def summarize_conversation(
     流程:
     1. 获取已有摘要（增量摘要）
     2. 选择需要摘要的旧消息（排除最近N条）
-    3. 调用LLM生成/扩展摘要
+    3. 调用LLM生成/扩展摘要（结构化输出ConversationSummary）
     4. 删除已摘要的旧消息
     5. 保存摘要到长期记忆
     """
@@ -97,59 +100,86 @@ async def summarize_conversation(
 
     # 构建摘要请求
     if existing_summary:
-        summary_prompt = (
+        summary_instruction = (
             f"以下是之前的对话摘要:\n{existing_summary}\n\n"
-            "请结合以上摘要和下面的新对话内容，生成一个更完整的摘要。\n"
-            "摘要要求:\n"
-            "1. 保留所有关键事实: 订单号、商品名、金额、日期等\n"
-            "2. 保留用户问题、Agent回复的核心结论\n"
-            "3. 保留情感变化和重要决策\n"
-            "4. 删除重复和无关信息\n"
-            "5. 摘要不超过300字\n\n"
-            "新对话内容:\n"
+            "请结合以上摘要和下面的新对话内容，生成一个更完整的结构化摘要。\n"
         )
     else:
-        summary_prompt = (
-            "请为以下对话生成一个简洁的摘要。\n"
-            "摘要要求:\n"
-            "1. 保留所有关键事实: 订单号、商品名、金额、日期等\n"
-            "2. 保留用户问题、Agent回复的核心结论\n"
-            "3. 保留情感变化和重要决策\n"
-            "4. 摘要不超过300字\n\n"
-            "对话内容:\n"
-        )
+        summary_instruction = "请为以下对话生成一个结构化摘要。\n"
+
+    summary_instruction += "摘要要求:\n1. 保留所有关键事实(订单号、商品名、金额、日期等)\n2. 保留用户问题、Agent回复的核心结论\n3. 保留情感变化和重要决策\n4. 摘要正文不超过300字\n"
 
     # 将旧消息格式化为文本
+    msg_text = ""
     for msg in messages_to_summarize:
         role = "用户" if isinstance(msg, HumanMessage) else "客服"
         content = str(msg.content)[:200] if msg.content else "[工具调用]"
-        summary_prompt += f"{role}: {content}\n"
+        msg_text += f"{role}: {content}\n"
 
-    # 调用LLM生成摘要
+    # 调用LLM生成结构化摘要(四层降级链)
     llm = get_llm()
-    try:
-        async with llm_semaphore:
-            response = await llm.ainvoke(
-                [
-                    SystemMessage(content="你是一个对话摘要助手，擅长提取关键信息。"),
-                    HumanMessage(content=summary_prompt),
-                ]
-            )
-        new_summary = response.content
-    except Exception as e:
-        logger.warning("摘要生成失败: %s", e)
-        return {}
+    from app.api.deps import llm_semaphore
 
-    # 删除旧消息（通过RemoveMessage）
+    # 构建messages用于结构化输出
+    summary_messages = [
+        SystemMessage(content="你是一个对话摘要助手，擅长提取关键信息并结构化输出。"),
+        HumanMessage(content=summary_instruction + "\n对话内容:\n" + msg_text),
+    ]
+
+    summary_result = await structured_llm_output(
+        model_class=ConversationSummary,
+        llm=llm,
+        messages=summary_messages,
+        semaphore=llm_semaphore,
+    )
+
+    # 解析失败，降级为纯文本摘要
+    if summary_result is None:
+        logger.warning("结构化摘要解析失败，降级为纯文本")
+        try:
+            response = await llm.ainvoke([
+                SystemMessage(content="你是一个对话摘要助手，擅长提取关键信息。请生成不超过300字的摘要。"),
+                HumanMessage(content=summary_instruction + "\n对话内容:\n" + msg_text),
+            ])
+            new_summary = response.content
+        except Exception as e:
+            logger.warning("纯文本摘要也失败: %s", e)
+            return {}
+    else:
+        # 结构化摘要成功，转为存储格式
+        new_summary = summary_result.summary_text
+
+        # 将结构化数据也保存（key_facts等）
+        summary_meta = summary_result.model_dump()
+        summary_meta["summary"] = new_summary
+        user_id = state.get("user_id", "anonymous")
+        session_id = state.get("session_id", "")
+        await _save_session_summary(store, user_id, session_id, new_summary, extra_data=summary_meta)
+
+        # 删除旧消息（通过RemoveMessage）
+        remove_messages = [RemoveMessage(id=msg.id) for msg in messages_to_summarize]
+
+        logger.info(
+            "摘要压缩完成: 删除%d条旧消息, 保留%d条近消息, 话题=%s, 已解决=%s",
+            len(remove_messages),
+            len(messages_to_keep),
+            summary_result.key_topics,
+            summary_result.resolved,
+        )
+
+        return {
+            "messages": remove_messages,
+            "conversation_summary": new_summary,
+        }
+
+    # 纯文本摘要的路径
     remove_messages = [RemoveMessage(id=msg.id) for msg in messages_to_summarize]
-
-    # 保存摘要到长期记忆
     user_id = state.get("user_id", "anonymous")
     session_id = state.get("session_id", "")
     await _save_session_summary(store, user_id, session_id, new_summary)
 
     logger.info(
-        "摘要压缩完成: 删除%d条旧消息, 保留%d条近消息, 摘要长度=%d字",
+        "摘要压缩完成(纯文本): 删除%d条旧消息, 保留%d条近消息, 摘要长度=%d字",
         len(remove_messages),
         len(messages_to_keep),
         len(new_summary),
@@ -166,10 +196,14 @@ async def _save_session_summary(
     user_id: str,
     session_id: str,
     summary: str,
+    extra_data: Optional[dict] = None,
 ) -> None:
     """保存会话摘要到长期记忆(跨会话可检索)"""
     try:
         ns = ("users", user_id, "session_summaries")
-        await store.aput(ns, session_id, {"summary": summary, "session_id": session_id})
+        data = {"summary": summary, "session_id": session_id}
+        if extra_data:
+            data.update(extra_data)
+        await store.aput(ns, session_id, data)
     except Exception as e:
         logger.warning("保存会话摘要失败: %s", e)

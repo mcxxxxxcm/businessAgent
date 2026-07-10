@@ -53,3 +53,12 @@ class CustomerServiceState(TypedDict):
 
     # 历史会话摘要(跨会话上下文)
     history_summary: str
+
+    # 对话轮次计数
+    turn_count: int
+
+    # 最大对话轮次(超过自动转人工)
+    max_turns: int
+
+    # 最终回复元数据(AgentResponseMeta结构化输出)
+    response_meta: Optional[dict]

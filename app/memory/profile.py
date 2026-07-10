@@ -7,53 +7,52 @@
 - (users, {user_id}, session_summaries) → 历史会话摘要
 """
 
-import json
 import logging
 from typing import Optional
 
+from pydantic import BaseModel, Field
 from langgraph.store.base import BaseStore
 
 logger = logging.getLogger(__name__)
 
 
-# === 画像结构定义 ===
+# === 画像结构定义 (Pydantic BaseModel) ===
 
-class UserProfile:
-    """用户画像数据结构"""
+class UserProfile(BaseModel):
+    """用户画像数据结构 - Pydantic校验
 
-    def __init__(self, data: dict | None = None):
-        data = data or {}
-        # 基础信息
-        self.total_conversations: int = data.get("total_conversations", 0)
-        self.first_seen: str = data.get("first_seen", "")
-        self.last_seen: str = data.get("last_seen", "")
+    所有字段有默认值，支持从空数据创建。
+    字段约束确保数据一致性。
+    """
+    # 基础信息
+    total_conversations: int = Field(default=0, ge=0, description="历史交互次数")
+    first_seen: str = Field(default="", description="首次交互时间")
+    last_seen: str = Field(default="", description="最近交互时间")
 
-        # 交互偏好
-        self.frequent_intents: dict[str, int] = data.get("frequent_intents", {})
-        self.avg_sentiment: str = data.get("avg_sentiment", "neutral")
+    # 交互偏好
+    frequent_intents: dict[str, int] = Field(
+        default_factory=dict,
+        description="意图频率分布，如{'order_query': 5, 'product_search': 3}",
+    )
+    avg_sentiment: str = Field(default="neutral", description="平均情感倾向")
 
-        # 关键事实
-        self.recent_orders: list[str] = data.get("recent_orders", [])  # 最近查询的订单号
-        self.recent_products: list[str] = data.get("recent_products", [])  # 最近搜索的商品
-        self.issues: list[dict] = data.get("issues", [])  # 历史问题记录
+    # 关键事实
+    recent_orders: list[str] = Field(
+        default_factory=list,
+        description="最近查询的订单号，最多10个",
+    )
+    recent_products: list[str] = Field(
+        default_factory=list,
+        description="最近搜索的商品，最多10个",
+    )
+    issues: list[dict] = Field(
+        default_factory=list,
+        description="历史问题记录，最多20条",
+    )
 
-        # 满意度
-        self.escalation_count: int = data.get("escalation_count", 0)
-        self.complaint_count: int = data.get("complaint_count", 0)
-
-    def to_dict(self) -> dict:
-        return {
-            "total_conversations": self.total_conversations,
-            "first_seen": self.first_seen,
-            "last_seen": self.last_seen,
-            "frequent_intents": self.frequent_intents,
-            "avg_sentiment": self.avg_sentiment,
-            "recent_orders": self.recent_orders[-10:],  # 最多保留10个
-            "recent_products": self.recent_products[-10:],
-            "issues": self.issues[-20:],  # 最多保留20条
-            "escalation_count": self.escalation_count,
-            "complaint_count": self.complaint_count,
-        }
+    # 满意度
+    escalation_count: int = Field(default=0, ge=0, description="历史转人工次数")
+    complaint_count: int = Field(default=0, ge=0, description="历史投诉次数")
 
     def to_prompt_text(self) -> str:
         """将画像转为可注入prompt的文本"""
@@ -96,7 +95,7 @@ async def load_user_profile(store: BaseStore, user_id: str) -> UserProfile:
     try:
         existing = await store.aget(ns, "main")
         if existing:
-            return UserProfile(existing.value)
+            return UserProfile(**existing.value)
     except Exception as e:
         logger.warning("加载用户画像失败: %s", e)
 
@@ -107,7 +106,12 @@ async def save_user_profile(store: BaseStore, user_id: str, profile: UserProfile
     """保存用户画像到PG Store"""
     ns = ("users", user_id, "profile")
     try:
-        await store.aput(ns, "main", profile.to_dict())
+        # Pydantic模型序列化时限制列表长度
+        data = profile.model_dump()
+        data["recent_orders"] = data["recent_orders"][-10:]
+        data["recent_products"] = data["recent_products"][-10:]
+        data["issues"] = data["issues"][-20:]
+        await store.aput(ns, "main", data)
     except Exception as e:
         logger.warning("保存用户画像失败: %s", e)
 
@@ -122,6 +126,9 @@ async def update_profile_from_state(
     """根据当前对话状态更新用户画像
 
     在response节点结束时调用，增量更新画像数据。
+    支持两种事实提取方式:
+    1. 规则匹配(快速，无LLM调用) - 默认
+    2. LLM提取(准确，有额外调用) - 按需启用
     """
     import datetime
 
@@ -147,10 +154,75 @@ async def update_profile_from_state(
     elif sentiment == "negative":
         profile.complaint_count += 1
 
-    # 从消息中提取关键事实
+    # 从消息中提取关键事实(规则匹配，快速)
     _extract_facts_from_messages(profile, messages)
 
     await save_user_profile(store, user_id, profile)
+
+
+async def update_profile_with_llm_extraction(
+    store: BaseStore,
+    user_id: str,
+    messages: list,
+) -> None:
+    """使用LLM提取关键事实更新用户画像(可选，更精确)
+
+    使用structured_llm_output四层降级链进行结构化事实提取。
+    当规则匹配不够准确时调用，会产生额外的LLM调用。
+    """
+    from app.api.deps import get_llm, llm_semaphore
+    from app.agent.schemas import FactExtraction, structured_llm_output
+
+    # 只取最近10条消息
+    recent = messages[-10:]
+    if not recent:
+        return
+
+    # 构建消息文本
+    msg_text = ""
+    for msg in recent:
+        role = "用户" if hasattr(msg, "type") and msg.type == "human" else "客服"
+        content = str(msg.content)[:300] if msg.content else ""
+        if content:
+            msg_text += f"{role}: {content}\n"
+
+    if not msg_text.strip():
+        return
+
+    from langchain_core.messages import SystemMessage, HumanMessage
+    extraction_messages = [
+        SystemMessage(content="你是一个信息提取助手。请从对话中提取关键结构化事实。"),
+        HumanMessage(content=f"请从以下对话中提取关键事实:\n\n{msg_text}"),
+    ]
+
+    llm = get_llm()
+    result = await structured_llm_output(
+        model_class=FactExtraction,
+        llm=llm,
+        messages=extraction_messages,
+        semaphore=llm_semaphore,
+    )
+
+    if result is None:
+        logger.warning("LLM事实提取失败(4层降级均失败)，跳过")
+        return
+
+    # 更新画像
+    profile = await load_user_profile(store, user_id)
+
+    for order_id in result.order_ids:
+        if order_id not in profile.recent_orders:
+            profile.recent_orders.append(order_id)
+
+    for product in result.product_names:
+        if product not in profile.recent_products:
+            profile.recent_products.append(product)
+
+    if result.complaint_reason:
+        profile.issues.append({"summary": result.complaint_reason})
+
+    await save_user_profile(store, user_id, profile)
+    logger.info("LLM事实提取完成: orders=%s, products=%s", result.order_ids, result.product_names)
 
 
 async def load_recent_summaries(

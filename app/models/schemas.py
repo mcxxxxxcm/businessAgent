@@ -23,6 +23,15 @@ class ChatRequest(BaseModel):
     )
 
 
+class ResponseMeta(BaseModel):
+    """回复元数据(AgentResponseMeta的结构化输出)"""
+
+    response_type: str = "direct_answer"
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    suggested_actions: list[str] = Field(default_factory=list)
+    needs_followup: bool = False
+
+
 class ChatResponse(BaseModel):
     """聊天响应(非流式)"""
 
@@ -31,6 +40,7 @@ class ChatResponse(BaseModel):
     intent: str | None = None
     sentiment: str | None = None
     needs_escalation: bool = False
+    response_meta: ResponseMeta | None = None
 
 
 class SSEEvent(BaseModel):

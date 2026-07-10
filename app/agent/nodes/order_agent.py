@@ -1,7 +1,5 @@
 """订单查询Agent节点"""
 
-from langchain_core.messages import SystemMessage, HumanMessage
-
 from app.agent.state import CustomerServiceState
 from app.agent.prompts import ORDER_AGENT_PROMPT
 from app.tools.order_query import query_order, track_logistics
@@ -13,20 +11,23 @@ async def order_agent_node(state: CustomerServiceState) -> dict:
     from app.api.deps import get_llm, llm_semaphore
 
     llm = get_llm()
-    order_llm = llm.bind_tools([query_order, track_logistics, send_order_notification])
 
-    # 格式化system prompt
-    system_content = ORDER_AGENT_PROMPT.format(
-        user_id=state.get("user_id", ""),
-        session_id=state.get("session_id", ""),
+    # 使用ChatPromptTemplate + LCEL管道 + bind_tools
+    chain = (
+        ORDER_AGENT_PROMPT
+        | llm.bind_tools([query_order, track_logistics, send_order_notification])
     )
 
+    # 构建输入变量
+    prompt_input = {
+        "user_id": state.get("user_id", ""),
+        "session_id": state.get("session_id", ""),
+        "memory_context": "",
+        "conversation_summary": "",
+        "history": state["messages"],
+    }
+
     async with llm_semaphore:
-        response = await order_llm.ainvoke(
-            [
-                SystemMessage(content=system_content),
-                *state["messages"],
-            ]
-        )
+        response = await chain.ainvoke(prompt_input)
 
     return {"messages": [response], "active_agent": "order_agent"}

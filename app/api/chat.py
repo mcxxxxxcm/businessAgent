@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends
 from sse_starlette.sse import EventSourceResponse
 from langchain_core.messages import HumanMessage
 
-from app.models.schemas import ChatRequest, ChatResponse
+from app.models.schemas import ChatRequest, ChatResponse, ResponseMeta
 from app.memory.cache import SessionCache
 
 logger = logging.getLogger(__name__)
@@ -52,6 +52,7 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
             "conversation_summary": "",
             "user_profile": None,
             "history_summary": "",
+            "response_meta": None,
         }
 
         # 更新用户在线状态
@@ -65,6 +66,9 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
 
         try:
             # 使用astream_events v3 API获取Token级流式输出
+            # 同时跟踪response_meta用于流结束时推送
+            response_meta_data = None
+
             async for event in graph.astream_events(
                 input_data,
                 config=config,
@@ -124,6 +128,14 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                             "data": json.dumps({"node": node_name}, ensure_ascii=False),
                         }
 
+                # 节点完成 — 捕获response节点的meta数据
+                elif kind == "on_chain_end":
+                    node_name = event.get("name", "")
+                    if node_name == "response":
+                        output = event.get("data", {}).get("output", {})
+                        if isinstance(output, dict) and output.get("response_meta"):
+                            response_meta_data = output["response_meta"]
+
         except Exception as e:
             logger.error("流式生成失败: %s", e)
             yield {
@@ -131,10 +143,13 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                 "data": json.dumps({"error": f"生成回复时出错: {str(e)}"}, ensure_ascii=False),
             }
 
-        # 流结束
+        # 流结束 — 推送response_meta(如有)
+        done_data = {"session_id": session_id}
+        if response_meta_data:
+            done_data["response_meta"] = response_meta_data
         yield {
             "event": "done",
-            "data": json.dumps({"session_id": session_id}, ensure_ascii=False),
+            "data": json.dumps(done_data, ensure_ascii=False),
         }
 
     return EventSourceResponse(event_generator())
@@ -169,6 +184,7 @@ async def chat_sync(request: ChatRequest) -> ChatResponse:
         "conversation_summary": "",
         "user_profile": None,
         "history_summary": "",
+        "response_meta": None,
     }
 
     # 更新用户在线状态
@@ -187,10 +203,15 @@ async def chat_sync(request: ChatRequest) -> ChatResponse:
             last_ai_msg = msg.content
             break
 
+    # 提取回复元数据
+    meta_data = result.get("response_meta")
+    response_meta = ResponseMeta(**meta_data) if meta_data else None
+
     return ChatResponse(
         session_id=session_id,
         reply=last_ai_msg,
         intent=result.get("intent"),
         sentiment=result.get("sentiment"),
         needs_escalation=result.get("needs_escalation", False),
+        response_meta=response_meta,
     )
