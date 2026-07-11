@@ -46,6 +46,8 @@ async def response_node(state: CustomerServiceState, *, store: BaseStore) -> dic
 
     # 否则生成通用回复
     if ai_response is None:
+        from langchain_core.messages import AIMessage
+
         llm = get_llm()
 
         # 构建记忆上下文
@@ -70,11 +72,15 @@ async def response_node(state: CustomerServiceState, *, store: BaseStore) -> dic
             "history": state["messages"][-10:],  # 最近10条消息
         }
 
-        async with llm_semaphore:
-            ai_response = await chain.ainvoke(
-                prompt_input,
-                config={"tags": ["response"]},  # 标记为response节点输出，SSE只放行此tag
-            )
+        try:
+            async with llm_semaphore:
+                ai_response = await chain.ainvoke(
+                    prompt_input,
+                    config={"tags": ["response"]},  # 标记为response节点输出，SSE只放行此tag
+                )
+        except Exception as e:
+            logger.error("response节点LLM调用失败: %s", e)
+            ai_response = AIMessage(content="抱歉，生成回复时遇到了问题，请稍后重试或联系人工客服。")
 
     # === 提取回复元数据(AgentResponseMeta结构化输出) ===
     response_meta = await _extract_response_meta(ai_response, state)

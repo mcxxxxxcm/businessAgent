@@ -1,9 +1,15 @@
 """订单查询Agent节点"""
 
+import logging
+
+from langchain_core.messages import AIMessage
+
 from app.agent.state import CustomerServiceState
 from app.agent.prompts import ORDER_AGENT_PROMPT
 from app.tools.order_query import query_order, track_logistics
 from app.tools.sms import send_order_notification
+
+logger = logging.getLogger(__name__)
 
 
 async def order_agent_node(state: CustomerServiceState) -> dict:
@@ -12,13 +18,11 @@ async def order_agent_node(state: CustomerServiceState) -> dict:
 
     llm = get_llm()
 
-    # 使用ChatPromptTemplate + LCEL管道 + bind_tools
     chain = (
         ORDER_AGENT_PROMPT
         | llm.bind_tools([query_order, track_logistics, send_order_notification])
     )
 
-    # 构建输入变量
     prompt_input = {
         "user_id": state.get("user_id", ""),
         "session_id": state.get("session_id", ""),
@@ -27,7 +31,15 @@ async def order_agent_node(state: CustomerServiceState) -> dict:
         "history": state["messages"],
     }
 
-    async with llm_semaphore:
-        response = await chain.ainvoke(prompt_input)
+    try:
+        async with llm_semaphore:
+            response = await chain.ainvoke(prompt_input)
+    except Exception as e:
+        logger.error("order_agent LLM调用失败: %s", e)
+        response = AIMessage(content="抱歉，处理您的订单查询时遇到了问题，请稍后重试或联系人工客服。")
 
-    return {"messages": [response], "active_agent": "order_agent"}
+    return {
+        "messages": [response],
+        "active_agent": "order_agent",
+        "react_step_count": state.get("react_step_count", 0) + 1,
+    }

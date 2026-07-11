@@ -1,4 +1,25 @@
-"""LangGraph StateGraph构建与编译 - 整个Agent的核心骨架"""
+"""LangGraph StateGraph构建与编译 - 整个Agent的核心骨架
+
+图拓扑:
+START → intent_router → [子Agent]
+                      ↙            ↘
+                有tool_calls      无tool_calls
+                    ↓                ↓
+               tool_executor_*   response
+                    ↓                ↓
+               route_after_tool   should_summarize?
+                ↙          ↘       ↙         ↘
+          有tool_calls    无    summarize     END
+          (且未超限)             ↓
+              ↓              END
+          对应子Agent
+          (ReAct循环)
+
+每个子Agent拥有独立的ToolNode，确保:
+1. 工具隔离: 子Agent只能调用自己绑定的工具，无法越权
+2. 错误容忍: handle_tool_errors=True，工具异常转为错误消息返回Agent
+3. 资源限制: ReAct循环步数限制，防止无限循环
+"""
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
@@ -14,7 +35,7 @@ from app.agent.nodes.response import response_node
 from app.agent.edges import route_by_intent
 from app.memory.summarizer import should_summarize, summarize_conversation
 
-# 所有工具列表(用于ToolNode)
+# === 工具导入 ===
 from app.tools.order_query import query_order, track_logistics
 from app.tools.product_search import search_products, check_inventory
 from app.tools.refund import create_refund, create_service_ticket, query_refund_status
@@ -23,44 +44,26 @@ from app.tools.human_escalation import transfer_to_human
 from app.tools.phone_call import place_phone_call
 from app.tools.sms import send_order_notification, send_refund_notification, send_custom_sms
 
-ALL_TOOLS = [
-    query_order,
-    track_logistics,
-    search_products,
-    check_inventory,
-    create_refund,
-    create_service_ticket,
-    query_refund_status,
-    search_knowledge_base,
-    transfer_to_human,
-    place_phone_call,
-    send_order_notification,
-    send_refund_notification,
-    send_custom_sms,
-]
+# === 按Agent分组的工具映射 ===
+AGENT_TOOLS = {
+    "order_agent": [query_order, track_logistics, send_order_notification],
+    "product_agent": [search_products, check_inventory],
+    "refund_agent": [create_refund, create_service_ticket, query_refund_status, send_refund_notification],
+    "knowledge_agent": [search_knowledge_base],
+    "escalation": [transfer_to_human, place_phone_call, send_custom_sms],
+}
 
 # 可路由回的子Agent列表
-SUB_AGENTS = ["order_agent", "product_agent", "refund_agent", "knowledge_agent", "escalation"]
+SUB_AGENTS = list(AGENT_TOOLS.keys())
+
+# 所有工具(供引用)
+ALL_TOOLS = [t for tools in AGENT_TOOLS.values() for t in tools]
+
+MAX_TOOL_CALLS = 5  # 单次请求最大工具调用次数(双重保护)
 
 
 def build_graph() -> StateGraph:
-    """构建客服Agent状态图 (支持ReAct自纠错循环 + CC记忆管理)
-
-    图拓扑:
-    START → intent_router → [子Agent]
-                          ↙            ↘
-                    有tool_calls      无tool_calls
-                        ↓                ↓
-                   tool_executor     response
-                        ↓                ↓
-                   route_after_tool   should_summarize?
-                    ↙          ↘       ↙         ↘
-              有tool_calls    无    summarize     END
-              (且未超限)             ↓
-                  ↓              END
-              对应子Agent
-              (ReAct循环)
-    """
+    """构建客服Agent状态图"""
     builder = StateGraph(CustomerServiceState)
 
     # === 添加节点 ===
@@ -73,8 +76,12 @@ def build_graph() -> StateGraph:
     builder.add_node("response", response_node)
     builder.add_node("summarize", summarize_conversation)
 
-    # ToolNode: 统一处理所有工具调用
-    builder.add_node("tool_executor", ToolNode(ALL_TOOLS))
+    # 每个子Agent独立的ToolNode — 工具隔离 + 错误容忍
+    for agent_name, tools in AGENT_TOOLS.items():
+        builder.add_node(
+            f"tool_executor_{agent_name}",
+            ToolNode(tools, handle_tool_errors=True),
+        )
 
     # === 入口边 ===
     builder.add_edge(START, "intent_router")
@@ -93,23 +100,24 @@ def build_graph() -> StateGraph:
         },
     )
 
-    # === 子Agent → 工具执行器 或 response ===
+    # === 子Agent → 对应的tool_executor 或 response ===
     for agent_name in SUB_AGENTS:
         builder.add_conditional_edges(
             agent_name,
             _route_after_agent,
             {
-                "tool_executor": "tool_executor",
+                f"tool_executor_{agent_name}": f"tool_executor_{agent_name}",
                 "response": "response",
             },
         )
 
-    # === ReAct循环: tool_executor → 路由回对应子Agent 或 response ===
-    builder.add_conditional_edges(
-        "tool_executor",
-        _route_after_tool,
-        {**{name: name for name in SUB_AGENTS}, "response": "response"},
-    )
+    # === ReAct循环: 各tool_executor → 路由回对应子Agent 或 response ===
+    for agent_name in SUB_AGENTS:
+        builder.add_conditional_edges(
+            f"tool_executor_{agent_name}",
+            _route_after_tool,
+            {agent_name: agent_name, "response": "response"},
+        )
 
     # === response → 摘要检查 ===
     builder.add_conditional_edges(
@@ -127,16 +135,18 @@ def build_graph() -> StateGraph:
     return builder
 
 
-MAX_TOOL_CALLS = 5  # 单次请求最大工具调用次数
-
-
 def _count_tool_messages(messages: list) -> int:
     """统计消息中ToolMessage的数量(即已执行的工具调用次数)"""
     return sum(1 for m in messages if getattr(m, "type", None) == "tool")
 
 
 def _route_after_agent(state: CustomerServiceState) -> str:
-    """子Agent执行后路由: 有工具调用→tool_executor，否则→response"""
+    """子Agent执行后路由: 有工具调用→对应tool_executor，否则→response
+
+    双重保护:
+    1. ToolMessage计数 >= MAX_TOOL_CALLS → 强制response
+    2. react_step_count >= max_react_steps → 强制response
+    """
     messages = state.get("messages", [])
     if not messages:
         return "response"
@@ -145,10 +155,20 @@ def _route_after_agent(state: CustomerServiceState) -> str:
 
     # 检查是否有待执行的工具调用
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        # 防无限循环: 超过最大工具调用次数则强制结束
+        # 保护1: 超过最大工具调用次数则强制结束
         if _count_tool_messages(messages) >= MAX_TOOL_CALLS:
             return "response"
-        return "tool_executor"
+
+        # 保护2: 超过最大ReAct步数则强制结束
+        react_steps = state.get("react_step_count", 0)
+        max_steps = state.get("max_react_steps", 5)
+        if react_steps >= max_steps:
+            return "response"
+
+        # 路由到当前Agent专属的tool_executor
+        active_agent = state.get("active_agent", "")
+        if active_agent in SUB_AGENTS:
+            return f"tool_executor_{active_agent}"
 
     return "response"
 
@@ -178,15 +198,7 @@ def _route_after_tool(state: CustomerServiceState) -> str:
 
 
 async def compile_graph(checkpointer, store):
-    """编译图(带checkpointer和store)
-
-    Args:
-        checkpointer: PostgreSQL AsyncPostgresSaver实例
-        store: PostgreSQL AsyncPostgresStore实例
-
-    Returns:
-        编译好的Runnable图
-    """
+    """编译图(带checkpointer和store)"""
     builder = build_graph()
     graph = builder.compile(
         checkpointer=checkpointer,

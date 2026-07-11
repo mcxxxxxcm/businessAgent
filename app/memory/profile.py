@@ -53,6 +53,10 @@ class UserProfile(BaseModel):
     # 满意度
     escalation_count: int = Field(default=0, ge=0, description="历史转人工次数")
     complaint_count: int = Field(default=0, ge=0, description="历史投诉次数")
+    satisfaction_scores: list[str] = Field(
+        default_factory=list,
+        description="最近满意度评价，最多20条",
+    )
 
     def to_prompt_text(self) -> str:
         """将画像转为可注入prompt的文本"""
@@ -270,3 +274,23 @@ def _extract_facts_from_messages(profile: UserProfile, messages: list) -> None:
         for product in product_matches:
             if product not in profile.recent_products:
                 profile.recent_products.append(product)
+
+
+async def update_satisfaction_score(user_id: str, rating: str) -> None:
+    """更新用户画像中的满意度评价(由反馈API调用)
+
+    Args:
+        user_id: 用户ID
+        rating: "positive" 或 "negative"
+    """
+    from app.api.deps import get_store
+
+    store = await get_store()
+    profile = await load_user_profile(store, user_id)
+
+    profile.satisfaction_scores.append(rating)
+    # 只保留最近20条
+    if len(profile.satisfaction_scores) > 20:
+        profile.satisfaction_scores = profile.satisfaction_scores[-20:]
+
+    await save_user_profile(store, user_id, profile)

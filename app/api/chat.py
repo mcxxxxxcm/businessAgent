@@ -11,6 +11,7 @@ from langchain_core.messages import HumanMessage
 
 from app.models.schemas import ChatRequest, ChatResponse, ResponseMeta
 from app.memory.cache import SessionCache
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +47,15 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
             "user_id": request.user_id,
             "session_id": session_id,
             "turn_count": 0,
-            "max_turns": 20,
+            "max_turns": settings.MAX_CONVERSATION_TURNS,
             "needs_escalation": False,
             "active_agent": None,
             "conversation_summary": "",
             "user_profile": None,
             "history_summary": "",
             "response_meta": None,
+            "react_step_count": 0,
+            "max_react_steps": settings.MAX_REACT_STEPS,
         }
 
         # 更新用户在线状态
@@ -105,9 +108,15 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                 # 工具调用完成
                 elif kind == "on_tool_end":
                     tool_name = event.get("name", "unknown")
+                    # 检查工具是否返回错误
+                    output = event.get("data", {}).get("output", "")
+                    is_error = hasattr(output, "status") and getattr(output, "status", "") == "error"
                     yield {
                         "event": "tool_end",
-                        "data": json.dumps({"tool": tool_name, "status": "completed"}, ensure_ascii=False),
+                        "data": json.dumps({
+                            "tool": tool_name,
+                            "status": "error" if is_error else "completed",
+                        }, ensure_ascii=False),
                     }
 
                 # 节点执行
@@ -178,13 +187,15 @@ async def chat_sync(request: ChatRequest) -> ChatResponse:
         "user_id": request.user_id,
         "session_id": session_id,
         "turn_count": 0,
-        "max_turns": 20,
+        "max_turns": settings.MAX_CONVERSATION_TURNS,
         "needs_escalation": False,
         "active_agent": None,
         "conversation_summary": "",
         "user_profile": None,
         "history_summary": "",
         "response_meta": None,
+        "react_step_count": 0,
+        "max_react_steps": settings.MAX_REACT_STEPS,
     }
 
     # 更新用户在线状态

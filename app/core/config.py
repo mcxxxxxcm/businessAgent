@@ -24,7 +24,12 @@ class Settings(BaseSettings):
 
     # === Agent ===
     MAX_CONVERSATION_TURNS: int = 20
+    MAX_REACT_STEPS: int = 5  # 单次请求最大ReAct步数(子Agent内部循环)
     SESSION_TIMEOUT_MINUTES: int = 30
+
+    # === 反馈 ===
+    FEEDBACK_NEGATIVE_ESCALATION_THRESHOLD: int = 2  # 同session连续negative反馈触发转人工
+    FEEDBACK_ENABLE_AUTO_ESCALATION: bool = True
 
     # === LangSmith (可选) ===
     LANGCHAIN_TRACING_V2: bool = False

@@ -98,3 +98,40 @@ class SessionCache:
             return await r.exists(key) > 0
         except Exception:
             return False
+
+    # === 反馈相关 ===
+
+    FEEDBACK_TTL = 604800  # 7天
+
+    @staticmethod
+    async def store_feedback(session_id: str, message_id: str, feedback: dict) -> None:
+        """存储用户反馈"""
+        try:
+            r = await get_redis()
+            key = f"feedback:{session_id}:{message_id}"
+            await r.setex(key, SessionCache.FEEDBACK_TTL, json.dumps(feedback, ensure_ascii=False))
+        except Exception as e:
+            logger.warning("Redis存储反馈失败: %s", e)
+
+    @staticmethod
+    async def get_session_negative_count(session_id: str) -> int:
+        """获取session内negative反馈次数"""
+        try:
+            r = await get_redis()
+            key = f"feedback:negative:{session_id}"
+            count = await r.get(key)
+            return int(count) if count else 0
+        except Exception:
+            return 0
+
+    @staticmethod
+    async def increment_negative_count(session_id: str) -> int:
+        """递增session的negative反馈计数，返回当前值"""
+        try:
+            r = await get_redis()
+            key = f"feedback:negative:{session_id}"
+            count = await r.incr(key)
+            await r.expire(key, SessionCache.FEEDBACK_TTL)
+            return count
+        except Exception:
+            return 0

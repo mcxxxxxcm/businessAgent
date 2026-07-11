@@ -129,6 +129,56 @@
         .tool-status.done { color: var(--success); }
         .tool-status.done .spinner { display: none; }
         .tool-status.done::before { content: "✓"; margin-right: 2px; }
+        .tool-status.error { color: #ef4444; }
+        .tool-status.error .spinner { display: none; }
+        .tool-status.error::before { content: "⚠"; margin-right: 2px; }
+
+        /* Feedback buttons */
+        .feedback-actions {
+            margin-top: 8px;
+            padding-top: 6px;
+            border-top: 1px dashed var(--border);
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+        .feedback-btn {
+            padding: 3px 10px;
+            border-radius: 14px;
+            border: 1px solid var(--border);
+            background: var(--card);
+            color: var(--text-secondary);
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .feedback-btn:hover { border-color: var(--primary); color: var(--primary); }
+        .feedback-btn.selected { opacity: 0.6; cursor: default; pointer-events: none; }
+        .feedback-btn.selected.positive { background: #dcfce7; border-color: #86efac; color: #166534; }
+        .feedback-btn.selected.negative { background: #fee2e2; border-color: #fca5a5; color: #991b1b; }
+        .feedback-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        /* Low confidence escalation */
+        .escalation-suggest {
+            margin-top: 6px;
+            padding: 6px 10px;
+            border-radius: 8px;
+            background: #fef3c7;
+            border: 1px solid #fcd34d;
+            color: #92400e;
+            font-size: 12px;
+        }
+        .escalation-suggest button {
+            margin-left: 6px;
+            padding: 2px 8px;
+            border-radius: 8px;
+            border: 1px solid #f59e0b;
+            background: #fbbf24;
+            color: #78350f;
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .escalation-suggest button:hover { background: #f59e0b; }
 
         /* Response meta (置信度/建议) */
         .response-meta {
@@ -492,12 +542,16 @@
                             addToolStatus(data.tool);
                             scrollToBottom();
                         } else if (eventType === 'tool_end') {
-                            // Mark tool as done
-                            const toolDivs = document.querySelectorAll('.tool-status:not(.done)');
+                            const toolDivs = document.querySelectorAll('.tool-status:not(.done):not(.error)');
                             toolDivs.forEach(td => {
                                 if (td.textContent.includes(data.tool)) {
-                                    td.classList.add('done');
-                                    td.innerHTML = `✓ ${data.tool} 完成`;
+                                    if (data.status === 'error') {
+                                        td.classList.add('error');
+                                        td.innerHTML = `⚠ ${data.tool} 失败`;
+                                    } else {
+                                        td.classList.add('done');
+                                        td.innerHTML = `✓ ${data.tool} 完成`;
+                                    }
                                 }
                             });
                         } else if (eventType === 'node_start') {
@@ -511,7 +565,10 @@
                             fullText += (fullText ? '\n' : '') + '⚠️ ' + (data.error || '出错了');
                             bubble.innerHTML = escapeHtml(fullText);
                         } else if (eventType === 'done') {
-                            // Stream complete — 展示回复元数据(如有)
+                            // Stream complete
+                            const msgId = 'msg_' + Date.now();
+                            
+                            // 展示回复元数据(如有)
                             if (data.response_meta) {
                                 const meta = data.response_meta;
                                 const metaDiv = document.createElement('div');
@@ -531,6 +588,26 @@
 
                                 metaDiv.innerHTML = metaHtml;
                                 bubble.appendChild(metaDiv);
+
+                                // 低置信度转人工提示
+                                if (confidence < 0.5) {
+                                    const escDiv = document.createElement('div');
+                                    escDiv.className = 'escalation-suggest';
+                                    escDiv.innerHTML = '我对回答不太确定，<button onclick="sendQuick(\'转人工客服\')">转人工客服</button>';
+                                    bubble.appendChild(escDiv);
+                                }
+                            }
+
+                            // 反馈按钮
+                            if (data.session_id) {
+                                const feedbackDiv = document.createElement('div');
+                                feedbackDiv.className = 'feedback-actions';
+                                feedbackDiv.innerHTML = `
+                                    <span style="font-size:11px;color:var(--text-secondary)">这条回复对您有帮助吗？</span>
+                                    <button class="feedback-btn positive" onclick="submitFeedback('${data.session_id}', '${msgId}', 'positive', this)">👍 有帮助</button>
+                                    <button class="feedback-btn negative" onclick="submitFeedback('${data.session_id}', '${msgId}', 'negative', this)">👎 没帮助</button>
+                                `;
+                                bubble.appendChild(feedbackDiv);
                             }
                         }
                     }
@@ -559,6 +636,49 @@
         sendBtn.disabled = false;
         messageInput.focus();
         scrollToBottom();
+    }
+
+    async function submitFeedback(sessionId, messageId, rating, btnEl) {
+        // 防止重复点击
+        const parentDiv = btnEl.parentElement;
+        const buttons = parentDiv.querySelectorAll('.feedback-btn');
+        buttons.forEach(b => b.disabled = true);
+        btnEl.classList.add('selected');
+
+        try {
+            const response = await fetch('/api/v1/feedback', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    session_id: sessionId,
+                    user_id: userId,
+                    message_id: messageId,
+                    rating: rating,
+                }),
+            });
+
+            if (!response.ok) {
+                console.error('反馈提交失败:', response.status);
+                buttons.forEach(b => b.disabled = false);
+                btnEl.classList.remove('selected');
+                return;
+            }
+
+            const data = await response.json();
+
+            // 转人工提示
+            if (data.escalation_triggered && data.escalation_message) {
+                const escDiv = document.createElement('div');
+                escDiv.className = 'escalation-suggest';
+                escDiv.innerHTML = data.escalation_message +
+                    ' <button onclick="sendQuick(\'转人工客服\')">转接人工</button>';
+                parentDiv.parentElement.appendChild(escDiv);
+            }
+        } catch (err) {
+            console.error('反馈提交异常:', err);
+            buttons.forEach(b => b.disabled = false);
+            btnEl.classList.remove('selected');
+        }
     }
 
     // Focus input on load

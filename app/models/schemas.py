@@ -1,5 +1,6 @@
 """Pydantic请求/响应模型"""
 
+from typing import Literal
 from pydantic import BaseModel, Field
 
 
@@ -20,6 +21,30 @@ class ChatRequest(BaseModel):
     session_id: str | None = Field(
         None,
         description="会话ID，不传则创建新会话",
+    )
+
+
+class FeedbackRequest(BaseModel):
+    """用户反馈请求"""
+
+    session_id: str = Field(..., description="会话ID")
+    user_id: str = Field(..., description="用户ID")
+    message_id: str = Field(..., description="消息ID")
+    rating: Literal["positive", "negative"] = Field(
+        ..., description="满意度评价: positive(有帮助)/negative(没帮助)"
+    )
+    comment: str | None = Field(None, max_length=500, description="可选文字反馈")
+
+
+class FeedbackResponse(BaseModel):
+    """反馈提交响应"""
+
+    received: bool = True
+    escalation_triggered: bool = Field(
+        False, description="是否触发了自动转人工"
+    )
+    escalation_message: str | None = Field(
+        None, description="转人工提示消息"
     )
 
 

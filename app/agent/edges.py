@@ -17,7 +17,8 @@ def route_by_intent(state: CustomerServiceState) -> str:
         return "human_escalation"
 
     # 优先级2: 超过最大轮次转人工
-    if state.get("turn_count", 0) >= state.get("max_turns", 20):
+    from app.core.config import settings
+    if state.get("turn_count", 0) >= state.get("max_turns", settings.MAX_CONVERSATION_TURNS):
         return "human_escalation"
 
     # 优先级3: 按意图路由

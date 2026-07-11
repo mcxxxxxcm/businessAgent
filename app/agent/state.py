@@ -62,3 +62,9 @@ class CustomerServiceState(TypedDict):
 
     # 最终回复元数据(AgentResponseMeta结构化输出)
     response_meta: Optional[dict]
+
+    # ReAct循环步数计数(子Agent内部循环，防止资源爆满)
+    react_step_count: int
+
+    # 单次请求最大ReAct步数(超过强制进入response)
+    max_react_steps: int
