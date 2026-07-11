@@ -31,6 +31,16 @@ class Settings(BaseSettings):
     FEEDBACK_NEGATIVE_ESCALATION_THRESHOLD: int = 2  # 同session连续negative反馈触发转人工
     FEEDBACK_ENABLE_AUTO_ESCALATION: bool = True
 
+    # === Checkpoint 清理 ===
+    CHECKPOINT_CLEANUP_INTERVAL_MINUTES: int = 60  # 清理任务运行间隔(分钟)
+    CHECKPOINT_KEEP_LATEST: bool = True  # 启用keep_latest策略: 每线程只保留最新checkpoint
+    CHECKPOINT_THREAD_TTL_DAYS: int = 7  # 超过N天未活跃的线程整体删除
+    CHECKPOINT_CLEANUP_BATCH_SIZE: int = 500  # 每批删除最大行数(防止长事务锁表)
+
+    # === Store TTL ===
+    STORE_DEFAULT_TTL_MINUTES: float = 43200  # Store默认TTL(30天 = 43200分钟)
+    STORE_SWEEP_INTERVAL_MINUTES: int = 60  # Store TTL扫描间隔(分钟)
+
     # === LangSmith (可选) ===
     LANGCHAIN_TRACING_V2: bool = False
     LANGCHAIN_API_KEY: str | None = None

@@ -10,8 +10,12 @@
 - 阿里云: 注册 → 企业认证 → 开通短信服务 → 申请签名和模板 → 获取AccessKey
 - 腾讯云: 注册 → 企业认证 → 开通短信服务 → 申请签名和模板 → 获取SecretId/Key
 - 模拟模式: 无需任何配置，短信内容只打印到日志（开发测试用）
+
+重要: 阿里云/腾讯云SDK为同步调用，通过 asyncio.to_thread 在线程池中执行，
+     避免阻塞asyncio事件循环。
 """
 
+import asyncio
 import json
 import logging
 from typing import Optional
@@ -20,42 +24,71 @@ from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
+# SMS调用超时(秒)
+SMS_TIMEOUT_SECONDS = 10
+
 
 # ============================================================
-# 短信发送核心逻辑
+# SDK Client 单例 (懒初始化，线程安全)
 # ============================================================
 
-async def _send_sms_aliyun(
+_aliyun_client = None
+_tencent_client = None
+
+
+def _get_aliyun_client():
+    """获取阿里云SMS Client单例(线程安全，SDK内部有锁)"""
+    global _aliyun_client
+    if _aliyun_client is not None:
+        return _aliyun_client
+
+    from app.core.config import settings
+    from alibabacloud_dysmsapi20170525.client import Client
+    from alibabacloud_tea_openapi import models as open_api_models
+
+    config = open_api_models.Config(
+        access_key_id=settings.ALIYUN_ACCESS_KEY_ID,
+        access_key_secret=settings.ALIYUN_ACCESS_KEY_SECRET,
+        endpoint="dysmsapi.aliyuncs.com",
+    )
+    _aliyun_client = Client(config)
+    return _aliyun_client
+
+
+def _get_tencent_client():
+    """获取腾讯云SMS Client单例(线程安全)"""
+    global _tencent_client
+    if _tencent_client is not None:
+        return _tencent_client
+
+    from app.core.config import settings
+    from tencentcloud.sms.v20210111 import sms_client
+    from tencentcloud.common import credential
+    from tencentcloud.common.profile.client_profile import ClientProfile
+    from tencentcloud.common.profile.http_profile import HttpProfile
+
+    cred = credential.Credential(settings.TENCENT_SECRET_ID, settings.TENCENT_SECRET_KEY)
+    http_profile = HttpProfile(endpoint="sms.tencentcloudapi.com")
+    client_profile = ClientProfile(httpProfile=http_profile)
+    _tencent_client = sms_client.SmsClient(cred, "ap-guangzhou", client_profile)
+    return _tencent_client
+
+
+# ============================================================
+# 同步发送函数 (在线程池中执行)
+# ============================================================
+
+def _send_sms_aliyun_sync(
     phone_number: str,
     template_code: str,
     template_params: dict,
     sign_name: str,
 ) -> dict:
-    """通过阿里云短信服务发送
-
-    模板示例:
-    - SMS_123456: "您的订单${order_id}已发货，预计${date}送达。"
-    - SMS_234567: "您的退款${amount}元已到账，请查收。"
-    - SMS_345678: "您的验证码为${code}，${exp}分钟内有效。"
-
-    依赖: pip install alibabacloud-dysmsapi20170525
-    """
-    from app.core.config import settings
-
+    """阿里云同步发送(在线程池中运行，不阻塞事件循环)"""
     try:
-        from alibabacloud_dysmsapi20170525.client import Client
+        client = _get_aliyun_client()
         from alibabacloud_dysmsapi20170525 import models as sms_models
-        from alibabacloud_tea_openapi import models as open_api_models
 
-        # 构建Client
-        config = open_api_models.Config(
-            access_key_id=settings.ALIYUN_ACCESS_KEY_ID,
-            access_key_secret=settings.ALIYUN_ACCESS_KEY_SECRET,
-            endpoint="dysmsapi.aliyuncs.com",
-        )
-        client = Client(config)
-
-        # 构建请求
         request = sms_models.SendSmsRequest(
             phone_numbers=phone_number,
             sign_name=sign_name,
@@ -63,7 +96,6 @@ async def _send_sms_aliyun(
             template_param=json.dumps(template_params, ensure_ascii=False),
         )
 
-        # 发送
         response = client.send_sms(request)
 
         if response.body.code == "OK":
@@ -83,28 +115,17 @@ async def _send_sms_aliyun(
         return {"success": False, "error": str(e)}
 
 
-async def _send_sms_tencent(
+def _send_sms_tencent_sync(
     phone_number: str,
     template_code: str,
     template_params: dict,
     sign_name: str,
 ) -> dict:
-    """通过腾讯云短信服务发送
-
-    依赖: pip install tencentcloud-sdk-python-sms
-    """
-    from app.core.config import settings
-
+    """腾讯云同步发送(在线程池中运行，不阻塞事件循环)"""
     try:
-        from tencentcloud.sms.v20210111 import sms_client, models as sms_models
-        from tencentcloud.common import credential
-        from tencentcloud.common.profile.client_profile import ClientProfile
-        from tencentcloud.common.profile.http_profile import HttpProfile
-
-        cred = credential.Credential(settings.TENCENT_SECRET_ID, settings.TENCENT_SECRET_KEY)
-        http_profile = HttpProfile(endpoint="sms.tencentcloudapi.com")
-        client_profile = ClientProfile(httpProfile=http_profile)
-        client = sms_client.SmsClient(cred, "ap-guangzhou", client_profile)
+        client = _get_tencent_client()
+        from tencentcloud.sms.v20210111 import models as sms_models
+        from app.core.config import settings
 
         # 腾讯云手机号格式: +8617628876799
         phone_with_prefix = f"+86{phone_number}"
@@ -131,6 +152,50 @@ async def _send_sms_tencent(
     except Exception as e:
         logger.error("腾讯云短信异常: %s", e)
         return {"success": False, "error": str(e)}
+
+
+# ============================================================
+# 异步包装层 (不阻塞事件循环)
+# ============================================================
+
+async def _send_sms_aliyun(
+    phone_number: str,
+    template_code: str,
+    template_params: dict,
+    sign_name: str,
+) -> dict:
+    """通过asyncio.to_thread在线程池中执行阿里云同步SDK调用"""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _send_sms_aliyun_sync,
+                phone_number, template_code, template_params, sign_name,
+            ),
+            timeout=SMS_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error("阿里云短信发送超时(%ds): phone=%s", SMS_TIMEOUT_SECONDS, phone_number)
+        return {"success": False, "error": f"发送超时({SMS_TIMEOUT_SECONDS}秒)"}
+
+
+async def _send_sms_tencent(
+    phone_number: str,
+    template_code: str,
+    template_params: dict,
+    sign_name: str,
+) -> dict:
+    """通过asyncio.to_thread在线程池中执行腾讯云同步SDK调用"""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _send_sms_tencent_sync,
+                phone_number, template_code, template_params, sign_name,
+            ),
+            timeout=SMS_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error("腾讯云短信发送超时(%ds): phone=%s", SMS_TIMEOUT_SECONDS, phone_number)
+        return {"success": False, "error": f"发送超时({SMS_TIMEOUT_SECONDS}秒)"}
 
 
 async def _send_sms_dummy(

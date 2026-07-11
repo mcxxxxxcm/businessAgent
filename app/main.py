@@ -55,13 +55,28 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("预初始化失败(将在首次请求时重试): %s", e)
 
+    # 启动Checkpoint定期清理后台任务
+    try:
+        from app.memory.checkpointer import start_checkpoint_cleanup_task
+        await start_checkpoint_cleanup_task()
+        logger.info("Checkpoint定期清理任务已启动")
+    except Exception as e:
+        logger.warning("Checkpoint清理任务启动失败: %s", e)
+
     yield
 
     # 关闭时清理资源
     logger.info("关闭连接池...")
     from app.core.redis import close_redis
     from app.core.postgres import close_pg_pool
+    from app.memory.checkpointer import stop_checkpoint_cleanup_task
+    from app.memory.store import close_store
 
+    # 先停止后台任务
+    await stop_checkpoint_cleanup_task()
+    await close_store()
+
+    # 再关闭连接
     await close_redis()
     await close_pg_pool()
 
