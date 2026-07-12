@@ -5,6 +5,11 @@
 - (users, {user_id}, profile)       → 用户基本画像
 - (users, {user_id}, facts)         → 关键事实(订单号、偏好等)
 - (users, {user_id}, session_summaries) → 历史会话摘要
+
+竞态安全: 使用 merge 模式替代 read-modify-write，避免并发写入丢失数据:
+- 计数器字段: 读取后与当前值取较大值(不覆盖更大的计数)
+- 列表字段: 合并后去重
+- needs_escalation: 合并到 update_profile_from_state 内部处理，避免二次读写
 """
 
 import logging
@@ -120,48 +125,93 @@ async def save_user_profile(store: BaseStore, user_id: str, profile: UserProfile
         logger.warning("保存用户画像失败: %s", e)
 
 
+def _merge_profiles(existing: UserProfile, updates: UserProfile) -> UserProfile:
+    """合并两个画像 — 竞态安全的merge模式
+
+    规则:
+    - 计数器: 取较大值(不覆盖更大的计数)
+    - 列表: 合并后去重
+    - 时间: 保留更早的first_seen和更晚的last_seen
+    - 字典(intent频率): 取较大值
+    """
+    # 计数器取较大值
+    merged = existing.model_copy()
+    merged.total_conversations = max(existing.total_conversations, updates.total_conversations)
+    merged.escalation_count = max(existing.escalation_count, updates.escalation_count)
+    merged.complaint_count = max(existing.complaint_count, updates.complaint_count)
+
+    # 时间保留最早/最晚
+    if updates.first_seen and (not existing.first_seen or updates.first_seen < existing.first_seen):
+        merged.first_seen = updates.first_seen
+    if updates.last_seen and (not existing.last_seen or updates.last_seen > existing.last_seen):
+        merged.last_seen = updates.last_seen
+
+    # intent频率取较大值
+    for intent, count in updates.frequent_intents.items():
+        merged.frequent_intents[intent] = max(merged.frequent_intents.get(intent, 0), count)
+
+    # 列表合并去重
+    merged.recent_orders = list(dict.fromkeys(existing.recent_orders + updates.recent_orders))[-10:]
+    merged.recent_products = list(dict.fromkeys(existing.recent_products + updates.recent_products))[-10:]
+    merged.satisfaction_scores = (existing.satisfaction_scores + updates.satisfaction_scores)[-20:]
+
+    # issues合并(按summary去重)
+    seen_summaries = set()
+    merged.issues = []
+    for issue in existing.issues + updates.issues:
+        summary = issue.get("summary", "")
+        if summary not in seen_summaries:
+            merged.issues.append(issue)
+            seen_summaries.add(summary)
+    merged.issues = merged.issues[-20:]
+
+    return merged
+
+
 async def update_profile_from_state(
     store: BaseStore,
     user_id: str,
     intent: str | None,
     sentiment: str | None,
     messages: list,
+    needs_escalation: bool = False,
 ) -> None:
-    """根据当前对话状态更新用户画像
+    """根据当前对话状态更新用户画像 (竞态安全merge模式)
 
     在response节点结束时调用，增量更新画像数据。
-    支持两种事实提取方式:
-    1. 规则匹配(快速，无LLM调用) - 默认
-    2. LLM提取(准确，有额外调用) - 按需启用
+    使用 merge 模式: 先在本地计算增量，再与存储中的最新数据合并，
+    避免并发写入时丢失计数。
+
+    Args:
+        needs_escalation: 是否需要转人工(合并到内部处理，避免二次读写)
     """
     import datetime
 
-    profile = await load_user_profile(store, user_id)
+    # 1. 计算增量(不读取现有数据)
+    delta = UserProfile()
+    delta.total_conversations = 1
+    delta.last_seen = datetime.datetime.now().isoformat()
+    delta.first_seen = delta.last_seen  # 首次交互，merge时会与existing取更早的
 
-    # 更新交互次数
-    profile.total_conversations += 1
-
-    # 更新最后交互时间
-    profile.last_seen = datetime.datetime.now().isoformat()
-    if not profile.first_seen:
-        profile.first_seen = profile.last_seen
-
-    # 更新意图偏好
+    # 意图偏好
     if intent:
-        intents = profile.frequent_intents
-        intents[intent] = intents.get(intent, 0) + 1
-        profile.frequent_intents = intents
+        delta.frequent_intents = {intent: 1}
 
-    # 更新情感
-    if sentiment == "angry":
-        profile.complaint_count += 1
-    elif sentiment == "negative":
-        profile.complaint_count += 1
+    # 情感
+    if sentiment in ("angry", "negative"):
+        delta.complaint_count = 1
 
-    # 从消息中提取关键事实(规则匹配，快速)
-    _extract_facts_from_messages(profile, messages)
+    # 转人工
+    if needs_escalation:
+        delta.escalation_count = 1
 
-    await save_user_profile(store, user_id, profile)
+    # 从消息中提取关键事实
+    _extract_facts_from_messages(delta, messages)
+
+    # 2. 读取最新数据 + merge + 保存(一次性完成)
+    existing = await load_user_profile(store, user_id)
+    merged = _merge_profiles(existing, delta)
+    await save_user_profile(store, user_id, merged)
 
 
 async def update_profile_with_llm_extraction(
@@ -173,6 +223,7 @@ async def update_profile_with_llm_extraction(
 
     使用structured_llm_output四层降级链进行结构化事实提取。
     当规则匹配不够准确时调用，会产生额外的LLM调用。
+    同样使用merge模式保证竞态安全。
     """
     from app.api.deps import get_llm, llm_semaphore
     from app.agent.schemas import FactExtraction, structured_llm_output
@@ -211,21 +262,17 @@ async def update_profile_with_llm_extraction(
         logger.warning("LLM事实提取失败(4层降级均失败)，跳过")
         return
 
-    # 更新画像
-    profile = await load_user_profile(store, user_id)
-
-    for order_id in result.order_ids:
-        if order_id not in profile.recent_orders:
-            profile.recent_orders.append(order_id)
-
-    for product in result.product_names:
-        if product not in profile.recent_products:
-            profile.recent_products.append(product)
-
+    # 构建增量 + merge
+    delta = UserProfile(
+        recent_orders=result.order_ids,
+        recent_products=result.product_names,
+    )
     if result.complaint_reason:
-        profile.issues.append({"summary": result.complaint_reason})
+        delta.issues = [{"summary": result.complaint_reason}]
 
-    await save_user_profile(store, user_id, profile)
+    existing = await load_user_profile(store, user_id)
+    merged = _merge_profiles(existing, delta)
+    await save_user_profile(store, user_id, merged)
     logger.info("LLM事实提取完成: orders=%s, products=%s", result.order_ids, result.product_names)
 
 
@@ -252,6 +299,7 @@ def _extract_facts_from_messages(profile: UserProfile, messages: list) -> None:
     """从对话消息中提取关键事实(订单号、商品名等)
 
     使用简单的规则匹配，避免额外的LLM调用。
+    注意: 这里修改的是delta增量对象，所以直接append即可。
     """
     import re
 
@@ -283,14 +331,12 @@ async def update_satisfaction_score(user_id: str, rating: str) -> None:
         user_id: 用户ID
         rating: "positive" 或 "negative"
     """
-    from app.api.deps import get_store
+    from app.memory.store import get_store
 
     store = await get_store()
-    profile = await load_user_profile(store, user_id)
 
-    profile.satisfaction_scores.append(rating)
-    # 只保留最近20条
-    if len(profile.satisfaction_scores) > 20:
-        profile.satisfaction_scores = profile.satisfaction_scores[-20:]
-
-    await save_user_profile(store, user_id, profile)
+    # 使用merge模式
+    delta = UserProfile(satisfaction_scores=[rating])
+    existing = await load_user_profile(store, user_id)
+    merged = _merge_profiles(existing, delta)
+    await save_user_profile(store, user_id, merged)

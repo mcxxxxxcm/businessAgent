@@ -15,7 +15,6 @@ from app.agent.state import CustomerServiceState
 from app.memory.profile import (
     UserProfile,
     load_user_profile,
-    save_user_profile,
     update_profile_from_state,
     load_recent_summaries,
 )
@@ -92,19 +91,14 @@ async def save_memory_after_response(
     messages = state.get("messages", [])
     needs_escalation = state.get("needs_escalation", False)
 
-    # 更新用户画像
+    # 更新用户画像(内部处理needs_escalation，避免二次read-modify-write)
     await update_profile_from_state(
         store=store,
         user_id=user_id,
         intent=intent,
         sentiment=sentiment,
         messages=messages,
+        needs_escalation=needs_escalation,
     )
-
-    # 如果有转人工，更新转人工计数
-    if needs_escalation:
-        profile = await load_user_profile(store, user_id)
-        profile.escalation_count += 1
-        await save_user_profile(store, user_id, profile)
 
     logger.debug("记忆保存完成: user_id=%s, intent=%s", user_id, intent)

@@ -33,19 +33,33 @@ MAX_SUMMARY_TOKENS = 512  # 摘要最大token数
 
 
 def _count_messages_tokens(messages: list[BaseMessage]) -> int:
-    """粗略估算消息列表的token数
+    """估算消息列表的token数
 
-    中文约1.5字/token，英文约4字符/token。
-    粗略估计: 1个中文字≈1token, 1个英文词≈1.3token
+    经验公式:
+    - 中文: 1字 ≈ 1.5 token (汉字在GPT/BPE分词中通常1-2 token)
+    - 英文: 1词 ≈ 1.3 token ≈ 4字符/token
+    - 工具调用: JSON结构约3字符/token
+    - 每条消息额外开销约4 token (角色标记等)
+
+    对比旧公式 len(content)//2:
+    - 旧: "你好世界" → 4//2 = 2 token (严重低估，实际约6)
+    - 新: "你好世界" → 4*1.5 + 4 = 10 token (保守但安全)
     """
+    import re
     total = 0
     for msg in messages:
         content = str(msg.content) if msg.content else ""
-        # 粗略估算: 字符数 / 2
-        total += len(content) // 2
-        # 工具调用也占token
+        if not content:
+            continue
+        # 统计中文字符数
+        chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", content))
+        # 非中文字符数(英文、标点、数字等)
+        non_chinese = len(content) - chinese_chars
+        # 中文1字≈1.5token，英文4字符≈1token，+4消息开销
+        total += int(chinese_chars * 1.5 + non_chinese / 4) + 4
+        # 工具调用额外计算
         if hasattr(msg, "tool_calls") and msg.tool_calls:
-            total += len(str(msg.tool_calls)) // 2
+            total += int(len(str(msg.tool_calls)) / 3)
     return total
 
 

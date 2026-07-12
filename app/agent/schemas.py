@@ -277,6 +277,7 @@ async def structured_llm_output(
     messages: list | None = None,
     config: dict | None = None,
     semaphore=None,
+    per_layer_timeout: float = 8.0,
 ) -> Optional[BaseModel]:
     """统一的结构化输出函数 — 四层降级链
 
@@ -304,6 +305,7 @@ async def structured_llm_output(
         messages: 直接传入的message列表(与prompt_input二选一)
         config: 传给llm.ainvoke的config(如tags)
         semaphore: asyncio.Semaphore，控制并发
+        per_layer_timeout: 每层超时秒数(默认8秒，防止降级链总耗时过长)
 
     Returns:
         解析成功的Pydantic模型实例，或None(所有层都失败)
@@ -322,6 +324,8 @@ async def structured_llm_output(
             messages=[SystemMessage(...), HumanMessage(...)],
         )
     """
+    import asyncio
+    import time
     import logging
     from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -329,11 +333,14 @@ async def structured_llm_output(
     schema_name = model_class.__name__
 
     async def _invoke(runnable, input_data, cfg=None):
-        """带信号量控制的invoke"""
-        if semaphore:
-            async with semaphore:
-                return await runnable.ainvoke(input_data, config=cfg)
-        return await runnable.ainvoke(input_data, config=cfg)
+        """带信号量控制+超时的invoke"""
+        async def _do_invoke():
+            if semaphore:
+                async with semaphore:
+                    return await runnable.ainvoke(input_data, config=cfg)
+            return await runnable.ainvoke(input_data, config=cfg)
+
+        return await asyncio.wait_for(_do_invoke(), timeout=per_layer_timeout)
 
     # 统一输入: 确定最终要传给LLM的输入数据
     if prompt_template is not None and prompt_input is not None:
@@ -346,16 +353,20 @@ async def structured_llm_output(
         return None
 
     cfg = config or {}
+    skip_layer2 = False  # Layer1抛NotImplementedError时跳过Layer2
 
     # ============================================================
     # Layer 1: with_structured_output(默认method)
     # ============================================================
+    t0 = time.monotonic()
     try:
         structured_llm = llm.with_structured_output(model_class)
         result = await _invoke(structured_llm, formatted_messages, cfg)
 
         if result is not None and isinstance(result, model_class):
-            logger.debug("%s: Layer 1 with_structured_output(default) 成功", schema_name)
+            logger.debug(
+                "%s: Layer1成功 (%.1fs)", schema_name, time.monotonic() - t0,
+            )
             return result
         elif result is not None:
             # 返回了结果但类型不对，尝试转换
@@ -363,37 +374,60 @@ async def structured_llm_output(
                 return model_class(**result) if isinstance(result, dict) else result
             except Exception:
                 pass
-    except (NotImplementedError, TypeError, ValueError, Exception) as e:
+    except NotImplementedError as e:
+        # NotImplementedError → 模型不支持structured_output，Layer2同样会失败
+        skip_layer2 = True
         logger.debug(
-            "%s: Layer 1 不可用(%s: %s)，降级到Layer 2",
-            schema_name, type(e).__name__, str(e)[:100],
+            "%s: Layer1 NotImplError→跳Layer2 (%.1fs): %s",
+            schema_name, time.monotonic() - t0, str(e)[:100],
+        )
+    except asyncio.TimeoutError:
+        logger.debug(
+            "%s: Layer1超时(%.1fs > %.1fs)", schema_name, time.monotonic() - t0, per_layer_timeout,
+        )
+    except (TypeError, ValueError, Exception) as e:
+        logger.debug(
+            "%s: Layer1失败 (%.1fs): %s: %s",
+            schema_name, time.monotonic() - t0, type(e).__name__, str(e)[:100],
         )
 
     # ============================================================
     # Layer 2: with_structured_output(method="tool_calling")
+    # 如果Layer1抛NotImplementedError则跳过(对智谱API两种method等价)
     # ============================================================
-    try:
-        structured_llm = llm.with_structured_output(model_class, method="tool_calling")
-        result = await _invoke(structured_llm, formatted_messages, cfg)
+    if skip_layer2:
+        logger.debug("%s: 跳过Layer2(与Layer1等价)", schema_name)
+    else:
+        t0 = time.monotonic()
+        try:
+            structured_llm = llm.with_structured_output(model_class, method="tool_calling")
+            result = await _invoke(structured_llm, formatted_messages, cfg)
 
-        if result is not None and isinstance(result, model_class):
-            logger.debug("%s: Layer 2 with_structured_output(tool_calling) 成功", schema_name)
-            return result
-        elif result is not None:
-            try:
-                return model_class(**result) if isinstance(result, dict) else result
-            except Exception:
-                pass
-    except (NotImplementedError, TypeError, ValueError, Exception) as e:
-        logger.debug(
-            "%s: Layer 2 不可用(%s: %s)，降级到Layer 3",
-            schema_name, type(e).__name__, str(e)[:100],
-        )
+            if result is not None and isinstance(result, model_class):
+                logger.debug(
+                    "%s: Layer2成功 (%.1fs)", schema_name, time.monotonic() - t0,
+                )
+                return result
+            elif result is not None:
+                try:
+                    return model_class(**result) if isinstance(result, dict) else result
+                except Exception:
+                    pass
+        except asyncio.TimeoutError:
+            logger.debug(
+                "%s: Layer2超时(%.1fs > %.1fs)", schema_name, time.monotonic() - t0, per_layer_timeout,
+            )
+        except (NotImplementedError, TypeError, ValueError, Exception) as e:
+            logger.debug(
+                "%s: Layer2失败 (%.1fs): %s: %s",
+                schema_name, time.monotonic() - t0, type(e).__name__, str(e)[:100],
+            )
 
     # ============================================================
     # Layer 3: 手动bind_tools + 解析tool_calls
     # 将Pydantic schema转为"假工具"，让模型以tool call形式输出
     # ============================================================
+    t0 = time.monotonic()
     try:
         tool_schema = _pydantic_to_tool_schema(model_class)
         bound_llm = llm.bind_tools(
@@ -408,25 +442,34 @@ async def structured_llm_output(
             args = tool_call.get("args", {})
             if args:
                 result = model_class(**args)
-                logger.debug("%s: Layer 3 bind_tools+parse_tool_call 成功", schema_name)
+                logger.debug(
+                    "%s: Layer3 bind_tools成功 (%.1fs)", schema_name, time.monotonic() - t0,
+                )
                 return result
 
         # 如果没有tool_calls，尝试从content解析
         if hasattr(response, "content") and response.content:
             parsed = safe_parse_model(model_class, response.content)
             if parsed:
-                logger.debug("%s: Layer 3 从content中解析成功", schema_name)
+                logger.debug(
+                    "%s: Layer3 content解析成功 (%.1fs)", schema_name, time.monotonic() - t0,
+                )
                 return parsed
 
+    except asyncio.TimeoutError:
+        logger.debug(
+            "%s: Layer3超时(%.1fs > %.1fs)", schema_name, time.monotonic() - t0, per_layer_timeout,
+        )
     except Exception as e:
         logger.debug(
-            "%s: Layer 3 失败(%s: %s)，降级到Layer 4",
-            schema_name, type(e).__name__, str(e)[:100],
+            "%s: Layer3失败 (%.1fs): %s: %s",
+            schema_name, time.monotonic() - t0, type(e).__name__, str(e)[:100],
         )
 
     # ============================================================
     # Layer 4: JSON Prompt + 手动解析 (最后兜底)
     # ============================================================
+    t0 = time.monotonic()
     try:
         json_instruction = schema_to_json_instruction(model_class)
         # 在原始messages前插入JSON格式指令
@@ -435,11 +478,17 @@ async def structured_llm_output(
         if hasattr(response, "content"):
             parsed = safe_parse_model(model_class, response.content)
             if parsed:
-                logger.debug("%s: Layer 4 JSON解析成功", schema_name)
+                logger.debug(
+                    "%s: Layer4 JSON解析成功 (%.1fs)", schema_name, time.monotonic() - t0,
+                )
                 return parsed
 
+    except asyncio.TimeoutError:
+        logger.debug(
+            "%s: Layer4超时(%.1fs > %.1fs)", schema_name, time.monotonic() - t0, per_layer_timeout,
+        )
     except Exception as e:
-        logger.warning("%s: Layer 4 JSON解析失败: %s", schema_name, e)
+        logger.warning("%s: Layer4 JSON解析失败: %s", schema_name, e)
 
     logger.warning("%s: 所有4层降级均失败", schema_name)
     return None

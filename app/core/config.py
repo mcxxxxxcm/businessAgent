@@ -21,6 +21,10 @@ class Settings(BaseSettings):
 
     # === 限流 ===
     RATE_LIMIT_PER_MINUTE: int = 30
+    RATE_LIMIT_REDIS_FALLBACK: str = "allow"  # Redis不可用时限流策略: allow(放行)/deny(拒绝503)
+
+    # === CORS ===
+    CORS_ALLOWED_ORIGINS: str = ""  # 允许的来源域名(逗号分隔)，空则允许所有但不带credentials
 
     # === Agent ===
     MAX_CONVERSATION_TURNS: int = 20
