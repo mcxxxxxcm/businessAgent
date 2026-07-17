@@ -20,14 +20,28 @@ async def intent_router_node(state: CustomerServiceState, *, store: BaseStore) -
     """意图分类路由节点
 
     同时完成:
-    1. LLM意图分类+情感分析（四层降级结构化输出）
-    2. 加载用户画像和历史摘要(记忆上下文)
+    1. 入口预检: 消息数超阈值时先压缩(防止长对话token爆炸)
+    2. LLM意图分类+情感分析（四层降级结构化输出）
+    3. 加载用户画像和历史摘要(记忆上下文)
     """
     from app.api.deps import get_llm, llm_semaphore
     from app.memory.profile import load_user_profile, load_recent_summaries
     from app.memory.manager import format_memory_for_prompt
 
     llm = get_llm()
+
+    # === 入口预检: 长对话消息压缩 ===
+    summary_updates = {}
+    messages = state.get("messages", [])
+    if len(messages) > 25:  # 比response后的阈值(20)更宽松，兜底保护
+        logger.info("入口预检: 消息数=%d > 25，触发紧急摘要压缩", len(messages))
+        from app.memory.summarizer import summarize_conversation
+        summary_updates = await summarize_conversation(state, store=store)
+        # 更新messages供后续使用
+        if "messages" in summary_updates:
+            messages = state["messages"]  # RemoveMessage由graph reducer处理
+        if "conversation_summary" in summary_updates:
+            state = {**state, "conversation_summary": summary_updates["conversation_summary"]}
 
     # === 加载记忆上下文 ===
     user_id = state.get("user_id", "anonymous")
@@ -47,8 +61,11 @@ async def intent_router_node(state: CustomerServiceState, *, store: BaseStore) -
         history_summary=history_summary,
     )
 
-    # 只取最近5条消息控制上下文长度和成本
-    recent_messages = state["messages"][-5:]
+    # 动态窗口: 短对话全取，长对话取摘要+最近8条
+    if len(messages) <= 8:
+        recent_messages = messages
+    else:
+        recent_messages = messages[-8:]
 
     # === 使用统一结构化输出函数(四层降级链) ===
     prompt_input = {
@@ -91,6 +108,7 @@ async def intent_router_node(state: CustomerServiceState, *, store: BaseStore) -
     # 将画像数据存入state，供后续节点使用
     profile_dict = profile.model_dump() if profile else {}
 
+    # 合并入口预检的摘要更新
     return {
         "intent": result.intent,
         "sentiment": result.sentiment,
@@ -100,4 +118,5 @@ async def intent_router_node(state: CustomerServiceState, *, store: BaseStore) -
         "turn_count": state.get("turn_count", 0) + 1,
         "user_profile": profile_dict,
         "history_summary": history_summary,
+        **summary_updates,  # 入口预检的摘要结果(RemoveMessage + conversation_summary)
     }

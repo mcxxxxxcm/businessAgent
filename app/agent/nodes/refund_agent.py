@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 async def refund_agent_node(state: CustomerServiceState) -> dict:
     """售后退款Agent - 绑定退款工具和退款通知短信工具"""
     from app.api.deps import get_llm, llm_semaphore
+    from app.memory.manager import build_agent_prompt_input
 
     llm = get_llm()
 
@@ -23,13 +24,7 @@ async def refund_agent_node(state: CustomerServiceState) -> dict:
         | llm.bind_tools([create_refund, create_service_ticket, query_refund_status, send_refund_notification])
     )
 
-    prompt_input = {
-        "user_id": state.get("user_id", ""),
-        "session_id": state.get("session_id", ""),
-        "memory_context": "",
-        "conversation_summary": "",
-        "history": state["messages"],
-    }
+    prompt_input = build_agent_prompt_input(state)
 
     try:
         async with llm_semaphore:

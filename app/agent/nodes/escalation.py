@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 async def escalation_node(state: CustomerServiceState) -> dict:
     """转人工客服节点 - 绑定转人工、电话外呼、短信通知工具"""
     from app.api.deps import get_llm, llm_semaphore
+    from app.memory.manager import build_agent_prompt_input
 
     llm = get_llm()
 
@@ -24,12 +25,9 @@ async def escalation_node(state: CustomerServiceState) -> dict:
         | llm.bind_tools([transfer_to_human, place_phone_call, send_custom_sms])
     )
 
-    prompt_input = {
-        "user_id": state.get("user_id", ""),
-        "session_id": state.get("session_id", ""),
-        "escalation_reason": state.get("escalation_reason", "用户请求转人工客服"),
-        "history": state["messages"],
-    }
+    # escalation节点使用独立prompt(有escalation_reason变量)，手动构建
+    prompt_input = build_agent_prompt_input(state)
+    prompt_input["escalation_reason"] = state.get("escalation_reason", "用户请求转人工客服")
 
     try:
         async with llm_semaphore:

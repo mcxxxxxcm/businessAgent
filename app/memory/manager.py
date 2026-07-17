@@ -23,6 +23,49 @@ from app.memory.summarizer import should_summarize, summarize_conversation
 logger = logging.getLogger(__name__)
 
 
+# 子Agent可传入的最大消息条数(防止token爆炸)
+MAX_AGENT_HISTORY = 10
+
+
+def build_agent_prompt_input(state: CustomerServiceState) -> dict:
+    """从state构建子Agent的prompt_input — 统一记忆注入逻辑
+
+    解决的问题:
+    1. 子Agent的memory_context/conversation_summary原为硬编码空字符串
+    2. 子Agent传入全量messages导致token浪费
+    3. 统一所有子Agent的记忆注入模式
+
+    Returns:
+        可直接传给ChatPromptTemplate.ainvoke()的字典
+    """
+    from app.memory.profile import UserProfile
+
+    # 构建记忆上下文
+    profile_data = state.get("user_profile", {})
+    profile = UserProfile(**profile_data) if profile_data else None
+    conversation_summary = state.get("conversation_summary", "")
+    history_summary = state.get("history_summary", "")
+
+    memory_text = format_memory_for_prompt(
+        profile=profile,
+        conversation_summary=conversation_summary,
+        history_summary=history_summary,
+        detailed=False,  # 子Agent使用精简模式: 核心画像+当前摘要，不含跨会话历史
+    )
+
+    # 限制消息条数，避免全量传入
+    messages = state.get("messages", [])
+    recent_messages = messages[-MAX_AGENT_HISTORY:]
+
+    return {
+        "user_id": state.get("user_id", ""),
+        "session_id": state.get("session_id", ""),
+        "memory_context": memory_text,
+        "conversation_summary": conversation_summary,
+        "history": recent_messages,
+    }
+
+
 async def load_memory_context(store: BaseStore, user_id: str) -> dict:
     """加载记忆上下文(在新会话开始时调用)
 
@@ -42,6 +85,7 @@ def format_memory_for_prompt(
     profile: Optional[UserProfile],
     conversation_summary: str = "",
     history_summary: str = "",
+    detailed: bool = True,
 ) -> str:
     """将记忆格式化为可注入System Prompt的文本块
 
@@ -49,6 +93,7 @@ def format_memory_for_prompt(
         profile: 用户画像
         conversation_summary: 当前会话的对话摘要
         history_summary: 历史会话摘要
+        detailed: True=完整画像，False=仅核心信息(子Agent使用以节省token)
 
     Returns:
         格式化后的记忆文本，直接拼接到System Prompt末尾
@@ -57,7 +102,7 @@ def format_memory_for_prompt(
 
     # 用户画像
     if profile:
-        profile_text = profile.to_prompt_text()
+        profile_text = profile.to_prompt_text(detailed=detailed)
         if profile_text:
             parts.append(f"【用户画像】\n{profile_text}")
 
@@ -65,8 +110,8 @@ def format_memory_for_prompt(
     if conversation_summary:
         parts.append(f"【当前对话摘要】\n{conversation_summary}")
 
-    # 历史会话摘要
-    if history_summary:
+    # 历史会话摘要(仅detailed模式注入，子Agent通常不需要跨会话历史)
+    if detailed and history_summary:
         parts.append(f"【近期历史】\n{history_summary}")
 
     if not parts:

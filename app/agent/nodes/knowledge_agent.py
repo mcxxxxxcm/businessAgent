@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 async def knowledge_agent_node(state: CustomerServiceState) -> dict:
     """知识库RAG Agent - 绑定search_knowledge_base工具"""
     from app.api.deps import get_llm, llm_semaphore
+    from app.memory.manager import build_agent_prompt_input
 
     llm = get_llm()
 
@@ -22,13 +23,7 @@ async def knowledge_agent_node(state: CustomerServiceState) -> dict:
         | llm.bind_tools([search_knowledge_base])
     )
 
-    prompt_input = {
-        "user_id": state.get("user_id", ""),
-        "session_id": state.get("session_id", ""),
-        "memory_context": "",
-        "conversation_summary": "",
-        "history": state["messages"],
-    }
+    prompt_input = build_agent_prompt_input(state)
 
     try:
         async with llm_semaphore:

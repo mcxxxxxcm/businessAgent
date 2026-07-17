@@ -63,25 +63,17 @@ class UserProfile(BaseModel):
         description="最近满意度评价，最多20条",
     )
 
-    def to_prompt_text(self) -> str:
-        """将画像转为可注入prompt的文本"""
+    def to_prompt_text(self, detailed: bool = True) -> str:
+        """将画像转为可注入prompt的文本
+
+        Args:
+            detailed: True=完整画像，False=仅核心信息(节省token)
+        """
         parts = []
 
-        if self.total_conversations > 0:
-            parts.append(f"历史交互次数: {self.total_conversations}")
-
-        if self.frequent_intents:
-            top_intents = sorted(
-                self.frequent_intents.items(), key=lambda x: x[1], reverse=True
-            )[:3]
-            intent_str = ", ".join(f"{k}({v}次)" for k, v in top_intents)
-            parts.append(f"常见需求: {intent_str}")
-
+        # === 核心信息(始终注入) ===
         if self.recent_orders:
-            parts.append(f"最近查询的订单: {', '.join(self.recent_orders[-3:])}")
-
-        if self.recent_products:
-            parts.append(f"最近搜索的商品: {', '.join(self.recent_products[-3:])}")
+            parts.append(f"最近订单: {', '.join(self.recent_orders[-3:])}")
 
         if self.escalation_count > 0:
             parts.append(f"历史转人工次数: {self.escalation_count}")
@@ -92,6 +84,21 @@ class UserProfile(BaseModel):
         if self.issues:
             latest = self.issues[-1]
             parts.append(f"最近问题: {latest.get('summary', '未知')}")
+
+        # === 次要信息(仅detailed模式注入) ===
+        if detailed:
+            if self.total_conversations > 0:
+                parts.append(f"历史交互次数: {self.total_conversations}")
+
+            if self.frequent_intents:
+                top_intents = sorted(
+                    self.frequent_intents.items(), key=lambda x: x[1], reverse=True
+                )[:3]
+                intent_str = ", ".join(f"{k}({v}次)" for k, v in top_intents)
+                parts.append(f"常见需求: {intent_str}")
+
+            if self.recent_products:
+                parts.append(f"最近搜索的商品: {', '.join(self.recent_products[-3:])}")
 
         return "\n".join(parts) if parts else ""
 

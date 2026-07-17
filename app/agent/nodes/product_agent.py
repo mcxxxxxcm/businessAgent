@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 async def product_agent_node(state: CustomerServiceState) -> dict:
     """商品搜索Agent - 绑定search_products和check_inventory工具"""
     from app.api.deps import get_llm, llm_semaphore
+    from app.memory.manager import build_agent_prompt_input
 
     llm = get_llm()
 
@@ -22,13 +23,7 @@ async def product_agent_node(state: CustomerServiceState) -> dict:
         | llm.bind_tools([search_products, check_inventory])
     )
 
-    prompt_input = {
-        "user_id": state.get("user_id", ""),
-        "session_id": state.get("session_id", ""),
-        "memory_context": "",
-        "conversation_summary": "",
-        "history": state["messages"],
-    }
+    prompt_input = build_agent_prompt_input(state)
 
     try:
         async with llm_semaphore:
