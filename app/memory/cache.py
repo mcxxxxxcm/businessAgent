@@ -135,3 +135,48 @@ class SessionCache:
             return count
         except Exception:
             return 0
+
+    # === 降级链统计 ===
+
+    @staticmethod
+    async def incr_degradation_stat(schema_name: str, layer: int, result: str) -> None:
+        """记录降级链每层结果
+
+        Args:
+            schema_name: Pydantic模型名(如IntentClassification)
+            layer: 层号(1-4)
+            result: "ok" 或 "fail"
+        """
+        try:
+            r = await get_redis()
+            key = f"stats:degradation:{schema_name}:layer{layer}:{result}"
+            await r.incr(key)
+        except Exception:
+            pass  # 统计失败不阻塞主流程
+
+    @staticmethod
+    async def get_degradation_stats() -> dict:
+        """获取降级链统计(聚合所有schema和layer的命中率)"""
+        try:
+            r = await get_redis()
+            keys = []
+            async for key in r.scan_iter(match="stats:degradation:*"):
+                keys.append(key)
+            if not keys:
+                return {}
+
+            values = await r.mget(keys)
+            stats = {}
+            for key, val in zip(keys, values):
+                # key格式: stats:degradation:{schema}:layer{N}:{ok|fail}
+                parts = key.decode() if isinstance(key, bytes) else key
+                parts = parts.split(":")
+                if len(parts) >= 5:
+                    schema = parts[2]
+                    layer_result = f"{parts[3]}:{parts[4]}"
+                    if schema not in stats:
+                        stats[schema] = {}
+                    stats[schema][layer_result] = int(val) if val else 0
+            return stats
+        except Exception:
+            return {}

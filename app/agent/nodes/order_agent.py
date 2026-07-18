@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 async def order_agent_node(state: CustomerServiceState) -> dict:
     """订单查询Agent - 绑定query_order、track_logistics和send_order_notification工具"""
-    from app.api.deps import get_llm, llm_semaphore
+    from app.api.deps import get_llm, acquire_llm_semaphore, release_llm_semaphore, LLMQueueTimeoutError
     from app.memory.manager import build_agent_prompt_input
 
     llm = get_llm()
@@ -27,8 +27,14 @@ async def order_agent_node(state: CustomerServiceState) -> dict:
     prompt_input = build_agent_prompt_input(state)
 
     try:
-        async with llm_semaphore:
+        await acquire_llm_semaphore()
+        try:
             response = await chain.ainvoke(prompt_input)
+        finally:
+            release_llm_semaphore()
+    except LLMQueueTimeoutError:
+        logger.warning("order_agent LLM排队超时，返回503")
+        response = AIMessage(content="当前服务繁忙，请稍后重试或联系人工客服。")
     except Exception as e:
         logger.error("order_agent LLM调用失败: %s", e)
         response = AIMessage(content="抱歉，处理您的订单查询时遇到了问题，请稍后重试或联系人工客服。")

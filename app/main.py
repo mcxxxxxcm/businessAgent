@@ -35,6 +35,9 @@ async def lifespan(app: FastAPI):
     setup_logging(debug=settings.DEBUG)
     logger.info("启动 %s v%s", settings.APP_NAME, settings.APP_VERSION)
 
+    # === LLM配置校验(启动时crash而非静默失效) ===
+    _validate_llm_config()
+
     # 启动时预初始化连接池和Graph，避免首次请求超时
     try:
         from app.core.postgres import get_pg_pool
@@ -62,6 +65,10 @@ async def lifespan(app: FastAPI):
         logger.info("Checkpoint定期清理任务已启动")
     except Exception as e:
         logger.warning("Checkpoint清理任务启动失败: %s", e)
+
+    # === LLM可达性检查(可选，防止API不可用时全站失效) ===
+    if settings.LLM_STARTUP_CHECK:
+        await _check_llm_reachability()
 
     yield
 
@@ -150,3 +157,55 @@ if __name__ == "__main__":
         port=8000,
         reload=True,
     )
+
+
+# === LLM启动校验 ===
+
+def _validate_llm_config() -> None:
+    """校验LLM配置 — API_KEY为空时crash，避免系统在'全残'状态下运行"""
+    if not settings.ZHIPU_API_KEY:
+        raise RuntimeError(
+            "ZHIPU_API_KEY未配置！系统将在所有LLM请求上返回401。"
+            "请在.env文件中设置ZHIPU_API_KEY，或设置LLM_STARTUP_CHECK=False跳过校验。"
+        )
+    if not settings.ZHIPU_API_BASE:
+        raise RuntimeError(
+            "ZHIPU_API_BASE未配置！LLM请求无法到达API端点。"
+        )
+    logger.info(
+        "LLM配置校验通过: model=%s, api_base=%s",
+        settings.ZHIPU_MODEL,
+        settings.ZHIPU_API_BASE,
+    )
+
+
+async def _check_llm_reachability() -> None:
+    """检查LLM API可达性 — 发一条简单请求验证模型可用
+
+    失败时crash启动，避免上线后发现全站返回401/404。
+    """
+    import asyncio
+
+    try:
+        from app.api.deps import get_llm
+        llm = get_llm()
+        # 发一条最短请求测试可达性
+        response = await asyncio.wait_for(
+            llm.ainvoke("你好"),
+            timeout=15.0,
+        )
+        if response and response.content:
+            logger.info("LLM可达性检查通过: model=%s", settings.ZHIPU_MODEL)
+        else:
+            logger.warning("LLM可达性检查: 返回空内容，但未报错(可能模型行为变化)")
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"LLM可达性检查超时(15s): model={settings.ZHIPU_MODEL}, "
+            f"api_base={settings.ZHIPU_API_BASE}。请检查网络和API状态。"
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"LLM可达性检查失败: model={settings.ZHIPU_MODEL}, "
+            f"error={type(e).__name__}: {str(e)[:200]}。"
+            f"系统将无法处理任何LLM请求，请检查API配置。"
+        )

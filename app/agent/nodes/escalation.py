@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 async def escalation_node(state: CustomerServiceState) -> dict:
     """转人工客服节点 - 绑定转人工、电话外呼、短信通知工具"""
-    from app.api.deps import get_llm, llm_semaphore
+    from app.api.deps import get_llm, acquire_llm_semaphore, release_llm_semaphore, LLMQueueTimeoutError
     from app.memory.manager import build_agent_prompt_input
 
     llm = get_llm()
@@ -30,8 +30,14 @@ async def escalation_node(state: CustomerServiceState) -> dict:
     prompt_input["escalation_reason"] = state.get("escalation_reason", "用户请求转人工客服")
 
     try:
-        async with llm_semaphore:
+        await acquire_llm_semaphore()
+        try:
             response = await chain.ainvoke(prompt_input)
+        finally:
+            release_llm_semaphore()
+    except LLMQueueTimeoutError:
+        logger.warning("escalation LLM排队超时，返回503")
+        response = AIMessage(content="当前服务繁忙，请稍后重试或联系人工客服。")
     except Exception as e:
         logger.error("escalation LLM调用失败: %s", e)
         response = AIMessage(content="抱歉，转接人工客服时遇到了问题，请稍后重试。")

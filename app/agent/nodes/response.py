@@ -31,7 +31,7 @@ async def response_node(state: CustomerServiceState, *, store: BaseStore) -> dic
     3. 提取回复元数据(AgentResponseMeta结构化校验)
     4. 保存用户长期记忆(画像、交互统计)
     """
-    from app.api.deps import get_llm, llm_semaphore
+    from app.api.deps import get_llm, acquire_llm_semaphore, release_llm_semaphore, LLMQueueTimeoutError
     from app.memory.manager import format_memory_for_prompt
     from app.memory.profile import UserProfile
 
@@ -73,11 +73,17 @@ async def response_node(state: CustomerServiceState, *, store: BaseStore) -> dic
         }
 
         try:
-            async with llm_semaphore:
+            await acquire_llm_semaphore()
+            try:
                 ai_response = await chain.ainvoke(
                     prompt_input,
                     config={"tags": ["response"]},  # 标记为response节点输出，SSE只放行此tag
                 )
+            finally:
+                release_llm_semaphore()
+        except LLMQueueTimeoutError:
+            logger.warning("response节点LLM排队超时")
+            ai_response = AIMessage(content="当前服务繁忙，请稍后重试或联系人工客服。")
         except Exception as e:
             logger.error("response节点LLM调用失败: %s", e)
             ai_response = AIMessage(content="抱歉，生成回复时遇到了问题，请稍后重试或联系人工客服。")
@@ -105,7 +111,7 @@ async def _extract_response_meta(ai_message, state: CustomerServiceState) -> dic
     Layer 4: JSON Prompt + 手动解析
     失败时使用规则推断兜底。
     """
-    from app.api.deps import get_llm, llm_semaphore
+    from app.api.deps import get_llm, acquire_llm_semaphore, release_llm_semaphore, LLMQueueTimeoutError
     from app.agent.schemas import AgentResponseMeta, structured_llm_output
 
     content = ai_message.content if hasattr(ai_message, "content") and ai_message.content else ""

@@ -26,7 +26,7 @@ end
 return current
 """
 
-# 限流降级计数器(进程内，用于监控)
+# 限流降级计数器(进程内缓存，真实值在Redis)
 _rate_limit_fallback_count = 0
 
 
@@ -63,9 +63,17 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             except HTTPException:
                 raise
             except Exception as e:
-                # Redis不可用 — 不再静默pass
+                # Redis不可用 — 不再静默pass，同时持久化计数到Redis(尝试)
                 global _rate_limit_fallback_count
                 _rate_limit_fallback_count += 1
+                # 尝试将计数持久化到Redis(重启不丢失)
+                try:
+                    from app.core.redis import get_redis
+                    r = await get_redis()
+                    total = await r.incr("stats:rate_limit:fallback_count")
+                    _rate_limit_fallback_count = total  # 同步进程内缓存
+                except Exception:
+                    pass  # Redis也不可用，只能靠进程内计数
                 logger.error(
                     "限流Redis不可用(累计%d次), 降级策略=%s, 错误: %s",
                     _rate_limit_fallback_count,

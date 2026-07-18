@@ -35,8 +35,19 @@ async def _create_checkpointer() -> AsyncPostgresSaver:
             await conn.execute(
                 "ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"
             )
+            # 单列索引(原有)
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS checkpoints_created_at_idx ON checkpoints(created_at)"
+            )
+            # 复合索引: 加速keep_latest清理的GROUP BY + TTL清理的HAVING
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS checkpoints_thread_ns_created_idx "
+                "ON checkpoints(thread_id, checkpoint_ns, created_at)"
+            )
+            # checkpoint_id索引: 加速DELETE的子查询
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS checkpoints_thread_ns_id_idx "
+                "ON checkpoints(thread_id, checkpoint_ns, checkpoint_id)"
             )
     except Exception:
         pass  # 列已存在或其他兼容性问题，不阻塞启动

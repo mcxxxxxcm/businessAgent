@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     ZHIPU_API_BASE: str = "https://open.bigmodel.cn/api/paas/v4/"
     LLM_TEMPERATURE: float = 0.3
     LLM_MAX_TOKENS: int = 2048
+    LLM_MAX_CONCURRENT: int = 5  # LLM最大并发数(Semaphore大小)
+    LLM_QUEUE_TIMEOUT: float = 30.0  # 排队超时秒数(超时返回503而非无限等)
+    LLM_STARTUP_CHECK: bool = True  # 启动时验证LLM API可达性(不可达则crash)
 
     # === PostgreSQL ===
     DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/cs_agent"
@@ -30,6 +33,8 @@ class Settings(BaseSettings):
     MAX_CONVERSATION_TURNS: int = 20
     MAX_REACT_STEPS: int = 5  # 单次请求最大ReAct步数(子Agent内部循环)
     SESSION_TIMEOUT_MINUTES: int = 30
+    GRAPH_EXECUTION_TIMEOUT: float = 60.0  # 单次请求总执行超时(秒)，防无限挂起
+    SSE_PING_INTERVAL: float = 15.0  # SSE心跳间隔(秒)，检测Ghost连接
 
     # === 反馈 ===
     FEEDBACK_NEGATIVE_ESCALATION_THRESHOLD: int = 2  # 同session连续negative反馈触发转人工

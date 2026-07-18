@@ -11,8 +11,40 @@ from app.core._async_utils import async_init_singleton
 
 logger = logging.getLogger(__name__)
 
-# LLM并发控制信号量
-llm_semaphore = asyncio.Semaphore(5)
+
+class LLMQueueTimeoutError(Exception):
+    """LLM信号量排队超时 — 请求过多时快速失败而非无限等待"""
+    pass
+
+
+# LLM并发控制信号量(大小由配置决定)
+llm_semaphore = asyncio.Semaphore(settings.LLM_MAX_CONCURRENT)
+
+
+async def acquire_llm_semaphore():
+    """获取LLM信号量(带超时) — 防止请求无限排队导致OOM
+
+    超时后抛出LLMQueueTimeoutError，由调用方处理(返回503或降级回复)。
+    """
+    try:
+        await asyncio.wait_for(
+            llm_semaphore.acquire(),
+            timeout=settings.LLM_QUEUE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "LLM信号量排队超时(%.0fs)，当前并发=%d，可能需要扩容",
+            settings.LLM_QUEUE_TIMEOUT,
+            settings.LLM_MAX_CONCURRENT,
+        )
+        raise LLMQueueTimeoutError(
+            f"LLM排队超时({settings.LLM_QUEUE_TIMEOUT}s)，请稍后重试"
+        )
+
+
+def release_llm_semaphore():
+    """释放LLM信号量"""
+    llm_semaphore.release()
 
 
 @lru_cache

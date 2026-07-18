@@ -54,12 +54,23 @@ async def health_check():
     except Exception:
         pass
 
+    # 获取降级链统计
+    degradation_stats = {}
+    try:
+        from app.memory.cache import SessionCache
+        degradation_stats = await SessionCache.get_degradation_stats()
+    except Exception:
+        pass
+
     # 判断整体状态
     if postgres_status != "ok":
         # PG不可用 = 核心组件故障
         overall = "unhealthy"
     elif redis_status != "ok":
         # Redis不可用 = 降级运行(无限流/无缓存)
+        overall = "degraded"
+    elif _is_degradation_critical(degradation_stats):
+        # 降级链Layer4命中率过高 = 体验劣化
         overall = "degraded"
     else:
         overall = "healthy"
@@ -75,6 +86,7 @@ async def health_check():
             "status": postgres_status,
             "latency_ms": postgres_latency_ms,
         },
+        "degradation": degradation_stats,
     }
 
     # unhealthy时返回503，方便负载均衡器摘除
@@ -83,3 +95,24 @@ async def health_check():
         return JSONResponse(content=result, status_code=503)
 
     return result
+
+
+def _is_degradation_critical(stats: dict) -> bool:
+    """判断降级链是否处于劣化状态
+
+    规则: 任一schema的Layer4成功数 > Layer1+Layer2+Layer3成功数之和
+    即Layer4成为主要成功路径 → 体验劣化
+    """
+    for schema, layers in stats.items():
+        l4_ok = 0
+        l123_ok = 0
+        for key, count in layers.items():
+            if ":ok" in key:
+                if "layer4" in key:
+                    l4_ok = count
+                else:
+                    l123_ok += count
+        # Layer4成为主要成功路径(>50%)
+        if l4_ok > 0 and l4_ok > l123_ok:
+            return True
+    return False

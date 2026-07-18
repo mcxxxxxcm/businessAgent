@@ -1,11 +1,12 @@
 """SSE流式聊天接口"""
 
+import asyncio
 import json
 import uuid
 import logging
 from collections.abc import AsyncGenerator
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
 from langchain_core.messages import HumanMessage
 
@@ -71,6 +72,7 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
             # 使用astream_events v3 API获取Token级流式输出
             # 同时跟踪response_meta用于流结束时推送
             response_meta_data = None
+            last_event_time = asyncio.get_event_loop().time()
 
             async for event in graph.astream_events(
                 input_data,
@@ -89,6 +91,7 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                     chunk = event["data"]["chunk"]
                     if hasattr(chunk, "content") and chunk.content:
                         if isinstance(chunk.content, str):
+                            last_event_time = asyncio.get_event_loop().time()
                             yield {
                                 "event": "token",
                                 "data": json.dumps({"content": chunk.content}, ensure_ascii=False),
@@ -97,6 +100,7 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                 # 工具调用开始
                 elif kind == "on_tool_start":
                     tool_name = event.get("name", "unknown")
+                    last_event_time = asyncio.get_event_loop().time()
                     yield {
                         "event": "tool_start",
                         "data": json.dumps(
@@ -111,6 +115,7 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                     # 检查工具是否返回错误
                     output = event.get("data", {}).get("output", "")
                     is_error = hasattr(output, "status") and getattr(output, "status", "") == "error"
+                    last_event_time = asyncio.get_event_loop().time()
                     yield {
                         "event": "tool_end",
                         "data": json.dumps({
@@ -144,6 +149,12 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                         output = event.get("data", {}).get("output", {})
                         if isinstance(output, dict) and output.get("response_meta"):
                             response_meta_data = output["response_meta"]
+
+                # SSE心跳: 长时间无token输出时发ping，检测Ghost连接
+                now = asyncio.get_event_loop().time()
+                if now - last_event_time > settings.SSE_PING_INTERVAL:
+                    last_event_time = now
+                    yield {"event": "ping", "data": ""}
 
         except Exception as e:
             logger.error("流式生成失败: %s", e)
@@ -202,7 +213,13 @@ async def chat_sync(request: ChatRequest) -> ChatResponse:
     await SessionCache.set_user_online(request.user_id, session_id)
 
     try:
-        result = await graph.ainvoke(input_data, config=config)
+        result = await asyncio.wait_for(
+            graph.ainvoke(input_data, config=config),
+            timeout=settings.GRAPH_EXECUTION_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.error("同步调用超时(%.0fs)", settings.GRAPH_EXECUTION_TIMEOUT)
+        raise HTTPException(status_code=504, detail="请求处理超时，请稍后重试")
     except Exception as e:
         logger.error("同步调用失败: %s", e)
         raise

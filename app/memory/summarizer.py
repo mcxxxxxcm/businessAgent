@@ -127,7 +127,14 @@ async def summarize_conversation(
     msg_text = ""
     for msg in messages_to_summarize:
         role = "用户" if isinstance(msg, HumanMessage) else "客服"
-        content = str(msg.content)[:200] if msg.content else "[工具调用]"
+        content = str(msg.content) if msg.content else "[工具调用]"
+        # 分类型截断: ToolMessage完整保留，AI消息500字，HumanMessage 200字
+        if getattr(msg, "type", None) == "tool":
+            pass  # 工具返回值完整保留(含关键数据)
+        elif getattr(msg, "type", None) == "ai":
+            content = content[:500]  # AI回复可能较长，保留更多
+        else:
+            content = content[:200]  # 用户消息通常较短
         msg_text += f"{role}: {content}\n"
 
     # 调用LLM生成结构化摘要(四层降级链)

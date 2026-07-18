@@ -342,6 +342,14 @@ async def structured_llm_output(
 
         return await asyncio.wait_for(_do_invoke(), timeout=per_layer_timeout)
 
+    async def _stat(layer: int, result: str) -> None:
+        """记录降级链统计到Redis(不阻塞主流程)"""
+        try:
+            from app.memory.cache import SessionCache
+            await SessionCache.incr_degradation_stat(schema_name, layer, result)
+        except Exception:
+            pass
+
     # 统一输入: 确定最终要传给LLM的输入数据
     if prompt_template is not None and prompt_input is not None:
         # 有ChatPromptTemplate: 先格式化为messages，再传给各层
@@ -367,25 +375,31 @@ async def structured_llm_output(
             logger.debug(
                 "%s: Layer1成功 (%.1fs)", schema_name, time.monotonic() - t0,
             )
+            await _stat(1, "ok")
             return result
         elif result is not None:
             # 返回了结果但类型不对，尝试转换
             try:
-                return model_class(**result) if isinstance(result, dict) else result
+                parsed = model_class(**result) if isinstance(result, dict) else result
+                await _stat(1, "ok")
+                return parsed
             except Exception:
                 pass
     except NotImplementedError as e:
         # NotImplementedError → 模型不支持structured_output，Layer2同样会失败
         skip_layer2 = True
+        await _stat(1, "fail")
         logger.debug(
             "%s: Layer1 NotImplError→跳Layer2 (%.1fs): %s",
             schema_name, time.monotonic() - t0, str(e)[:100],
         )
     except asyncio.TimeoutError:
+        await _stat(1, "fail")
         logger.debug(
             "%s: Layer1超时(%.1fs > %.1fs)", schema_name, time.monotonic() - t0, per_layer_timeout,
         )
     except (TypeError, ValueError, Exception) as e:
+        await _stat(1, "fail")
         logger.debug(
             "%s: Layer1失败 (%.1fs): %s: %s",
             schema_name, time.monotonic() - t0, type(e).__name__, str(e)[:100],
@@ -407,6 +421,7 @@ async def structured_llm_output(
                 logger.debug(
                     "%s: Layer2成功 (%.1fs)", schema_name, time.monotonic() - t0,
                 )
+                await _stat(2, "ok")
                 return result
             elif result is not None:
                 try:
@@ -414,10 +429,12 @@ async def structured_llm_output(
                 except Exception:
                     pass
         except asyncio.TimeoutError:
+            await _stat(2, "fail")
             logger.debug(
                 "%s: Layer2超时(%.1fs > %.1fs)", schema_name, time.monotonic() - t0, per_layer_timeout,
             )
         except (NotImplementedError, TypeError, ValueError, Exception) as e:
+            await _stat(2, "fail")
             logger.debug(
                 "%s: Layer2失败 (%.1fs): %s: %s",
                 schema_name, time.monotonic() - t0, type(e).__name__, str(e)[:100],
@@ -445,6 +462,7 @@ async def structured_llm_output(
                 logger.debug(
                     "%s: Layer3 bind_tools成功 (%.1fs)", schema_name, time.monotonic() - t0,
                 )
+                await _stat(3, "ok")
                 return result
 
         # 如果没有tool_calls，尝试从content解析
@@ -454,13 +472,16 @@ async def structured_llm_output(
                 logger.debug(
                     "%s: Layer3 content解析成功 (%.1fs)", schema_name, time.monotonic() - t0,
                 )
+                await _stat(3, "ok")
                 return parsed
 
     except asyncio.TimeoutError:
+        await _stat(3, "fail")
         logger.debug(
             "%s: Layer3超时(%.1fs > %.1fs)", schema_name, time.monotonic() - t0, per_layer_timeout,
         )
     except Exception as e:
+        await _stat(3, "fail")
         logger.debug(
             "%s: Layer3失败 (%.1fs): %s: %s",
             schema_name, time.monotonic() - t0, type(e).__name__, str(e)[:100],
@@ -481,13 +502,16 @@ async def structured_llm_output(
                 logger.debug(
                     "%s: Layer4 JSON解析成功 (%.1fs)", schema_name, time.monotonic() - t0,
                 )
+                await _stat(4, "ok")
                 return parsed
 
     except asyncio.TimeoutError:
+        await _stat(4, "fail")
         logger.debug(
             "%s: Layer4超时(%.1fs > %.1fs)", schema_name, time.monotonic() - t0, per_layer_timeout,
         )
     except Exception as e:
+        await _stat(4, "fail")
         logger.warning("%s: Layer4 JSON解析失败: %s", schema_name, e)
 
     logger.warning("%s: 所有4层降级均失败", schema_name)
