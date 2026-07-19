@@ -113,9 +113,10 @@ async def search_knowledge_base(query: str, category: str | None = None) -> list
 
     for item in _MOCK_KNOWLEDGE:
         if item["category"] in target_categories:
-            # 简单的相关性评分
+            # 简单的相关性评分(逐词匹配，非逐字符)
             score = 0.5
-            for word in query_lower:
+            query_words = query_lower.split()  # 按空格分词
+            for word in query_words:
                 if word in item["content"].lower() or word in item["title"].lower():
                     score += 0.1
             results.append({**item, "relevance_score": min(score, 1.0)})

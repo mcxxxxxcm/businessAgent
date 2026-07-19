@@ -29,12 +29,16 @@ async def place_phone_call(
     if not phone_number.startswith("1"):
         return "手机号格式不正确，应以1开头。"
 
+    # PII脱敏: 日志和返回值中不暴露完整手机号
+    from app.core.auth import mask_phone
+    masked_phone = mask_phone(phone_number)
+
     try:
         from app.api.deps import get_outbound_manager
 
         manager = await get_outbound_manager()
         call = await manager.place_call(
-            phone_number=phone_number,
+            phone_number=phone_number,  # 实际调用仍传完整号码
             user_id=user_id or None,
             metadata={"reason": reason},
         )
@@ -44,7 +48,7 @@ async def place_phone_call(
 
         return (
             f"已成功发起外呼，呼叫ID: {call.call_id}，"
-            f"被叫号码: {phone_number}，"
+            f"被叫号码: {masked_phone}，"  # 返回值用脱敏号码
             f"当前状态: {call.status.value}。"
             f"用户接听后AI将自动开始对话。"
         )

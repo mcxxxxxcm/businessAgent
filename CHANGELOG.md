@@ -1,5 +1,47 @@
 # CHANGELOG
 
+## [2026-07-12] 深度安全审查修复 — 认证/PII/XSS/供应链
+
+### 🔴 Critical修复
+
+#### #1 全API无认证 → JWT认证体系
+- **新增**: `app/core/auth.py` — JWT创建/验证/依赖注入 + PII脱敏函数(mask_phone/mask_pii)
+- **新增**: `app/api/auth.py` — 登录接口(POST /api/v1/auth/login) + 令牌验证(GET /api/v1/auth/verify)
+- **新增**: `requirements.txt` PyJWT依赖
+- **修改**: `app/core/config.py` — 新增JWT_SECRET_KEY/JWT_ALGORITHM/JWT_EXPIRE_MINUTES/AUTH_ENABLED
+- **修改**: `app/main.py` — 注册auth_router + 启动校验JWT_SECRET_KEY
+
+#### #2 Session劫持 → session_id服务端生成+UUID格式校验
+- **修改**: `app/api/chat.py` — session_id由服务端UUID生成，客户端传入时验证UUID格式
+
+### 🟡 High修复
+
+#### #3 DOM XSS → escapeHtml转义escalation_message
+- **修改**: `app/static/index.html` — escalation_message通过escapeHtml()转义后再innerHTML
+
+#### #4 手机号PII泄露 → 返回值脱敏
+- **修改**: `app/tools/phone_call.py` — 返回值中手机号脱敏为138****5678
+- **修改**: `app/tools/sms.py` — 3个短信工具返回值中手机号脱敏
+
+#### #5 调试接口暴露 → 生产环境禁用
+- **修改**: `app/api/sessions.py` — /state接口在DEBUG=False时返回404
+
+### 🟠 Medium修复
+
+#### #6 依赖无上界 → 锁定major version上界
+- **修改**: `requirements.txt` — 所有依赖加`<N.0.0`上界(LangChain严格锁`<0.4.0`)
+
+#### #7 user_id无限制 → max_length=64
+- **修改**: `app/models/schemas.py` — ChatRequest.user_id和FeedbackRequest.user_id加max_length=64
+
+#### #8 Feedback无限流 → 同session每分钟5次
+- **修改**: `app/api/feedback.py` — Redis计数防刷，超限返回received=False
+
+#### #9 knowledge_rag逐字符匹配 → 逐词匹配
+- **修改**: `app/tools/knowledge_rag.py` — `for word in query_lower`改为`query_lower.split()`
+
+---
+
 ## [2026-07-12] 对抗性审查修复 — 3个月后失效模式
 
 ### 🔴 高优先级修复

@@ -323,7 +323,8 @@ async def send_order_notification(
     )
 
     if result["success"]:
-        return f"已向{phone_number}发送订单{order_id}的{status}通知短信。"
+        from app.core.auth import mask_phone
+        return f"已向{mask_phone(phone_number)}发送订单{order_id}的{status}通知短信。"
     return f"短信发送失败: {result.get('error', '未知原因')}"
 
 
@@ -356,7 +357,8 @@ async def send_refund_notification(
     )
 
     if result["success"]:
-        return f"已向{phone_number}发送订单{order_id}退款{amount}元的{status}通知短信。"
+        from app.core.auth import mask_phone
+        return f"已向{mask_phone(phone_number)}发送订单{order_id}退款{amount}元的{status}通知短信。"
     return f"短信发送失败: {result.get('error', '未知原因')}"
 
 
@@ -384,7 +386,8 @@ async def send_custom_sms(
 
     if result["success"]:
         mode = result.get("mode", "")
-        msg = f"已向{phone_number}发送短信。"
+        from app.core.auth import mask_phone
+        msg = f"已向{mask_phone(phone_number)}发送短信。"
         if mode == "dummy":
             msg += f"(模拟模式，内容: {content})"
         return msg

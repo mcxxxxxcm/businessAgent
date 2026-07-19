@@ -16,6 +16,7 @@ class ChatRequest(BaseModel):
     user_id: str = Field(
         ...,
         min_length=1,
+        max_length=64,
         description="用户ID",
     )
     session_id: str | None = Field(
@@ -28,7 +29,7 @@ class FeedbackRequest(BaseModel):
     """用户反馈请求"""
 
     session_id: str = Field(..., description="会话ID")
-    user_id: str = Field(..., description="用户ID")
+    user_id: str = Field(..., max_length=64, description="用户ID")
     message_id: str = Field(..., description="消息ID")
     rating: Literal["positive", "negative"] = Field(
         ..., description="满意度评价: positive(有帮助)/negative(没帮助)"

@@ -63,7 +63,10 @@ async def end_session(session_id: str):
 
 @router.get("/{session_id}/state")
 async def get_session_state(session_id: str):
-    """获取会话完整状态(调试用)"""
+    """获取会话完整状态(调试用) — 生产环境禁用"""
+    from app.core.config import settings
+    if not settings.DEBUG:
+        raise HTTPException(status_code=404, detail="此接口仅在调试模式可用")
     try:
         from app.api.deps import get_graph
 

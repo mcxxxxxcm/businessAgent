@@ -24,6 +24,7 @@ from app.api.chat import router as chat_router
 from app.api.sessions import router as sessions_router
 from app.api.outbound import router as outbound_router
 from app.api.feedback import router as feedback_router
+from app.api.auth import router as auth_router
 from app.api.middleware import RateLimitMiddleware, setup_cors
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,7 @@ app.include_router(chat_router)
 app.include_router(sessions_router)
 app.include_router(outbound_router)
 app.include_router(feedback_router)
+app.include_router(auth_router)
 
 # 静态文件
 STATIC_DIR = Path(__file__).parent / "static"
@@ -172,10 +174,18 @@ def _validate_llm_config() -> None:
         raise RuntimeError(
             "ZHIPU_API_BASE未配置！LLM请求无法到达API端点。"
         )
+    # JWT认证校验
+    if settings.AUTH_ENABLED and not settings.JWT_SECRET_KEY:
+        raise RuntimeError(
+            "AUTH_ENABLED=True但JWT_SECRET_KEY未配置！"
+            "请在.env文件中设置JWT_SECRET_KEY(随机长字符串)，"
+            "或设置AUTH_ENABLED=False关闭认证(仅限开发环境)。"
+        )
     logger.info(
-        "LLM配置校验通过: model=%s, api_base=%s",
+        "LLM配置校验通过: model=%s, api_base=%s, auth=%s",
         settings.ZHIPU_MODEL,
         settings.ZHIPU_API_BASE,
+        settings.AUTH_ENABLED,
     )
 
 

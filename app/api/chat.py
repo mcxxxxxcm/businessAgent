@@ -36,7 +36,18 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
             }
             return
 
-        session_id = request.session_id or str(uuid.uuid4())
+        # session_id由服务端生成(防会话劫持/固定攻击)
+        if request.session_id:
+            try:
+                session_id = str(uuid.UUID(request.session_id))
+            except ValueError:
+                yield {
+                    "event": "error",
+                    "data": json.dumps({"error": "session_id格式无效"}, ensure_ascii=False),
+                }
+                return
+        else:
+            session_id = str(uuid.uuid4())
         config = {
             "configurable": {
                 "thread_id": session_id,
@@ -186,7 +197,14 @@ async def chat_sync(request: ChatRequest) -> ChatResponse:
         logger.error("获取Graph实例失败: %s", e)
         raise
 
-    session_id = request.session_id or str(uuid.uuid4())
+    # session_id由服务端生成(防会话劫持/固定攻击)
+    if request.session_id:
+        try:
+            session_id = str(uuid.UUID(request.session_id))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="session_id格式无效")
+    else:
+        session_id = str(uuid.uuid4())
     config = {
         "configurable": {
             "thread_id": session_id,

@@ -670,7 +670,7 @@
             if (data.escalation_triggered && data.escalation_message) {
                 const escDiv = document.createElement('div');
                 escDiv.className = 'escalation-suggest';
-                escDiv.innerHTML = data.escalation_message +
+                escDiv.innerHTML = escapeHtml(data.escalation_message) +
                     ' <button onclick="sendQuick(\'转人工客服\')">转接人工</button>';
                 parentDiv.parentElement.appendChild(escDiv);
             }

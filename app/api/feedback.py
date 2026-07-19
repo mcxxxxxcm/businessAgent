@@ -29,6 +29,18 @@ async def submit_feedback(request: FeedbackRequest) -> FeedbackResponse:
     2. 更新negative计数
     3. 判断是否触发转人工
     """
+    # 防刷: 同session每分钟最多5次反馈
+    try:
+        from app.core.redis import get_redis
+        r = await get_redis()
+        rate_key = f"ratelimit:feedback:{request.session_id}"
+        count = await r.incr(rate_key)
+        if count == 1:
+            await r.expire(rate_key, 60)
+        if count > 5:
+            return FeedbackResponse(received=False)
+    except Exception:
+        pass  # Redis不可用不阻塞
     # 存储反馈
     feedback_data = {
         "rating": request.rating,
