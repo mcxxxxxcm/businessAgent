@@ -1,5 +1,52 @@
 # CHANGELOG
 
+## [2026-07-20] 多意图编排动态进度条 + 折叠展开子任务结果
+
+### 新增
+
+#### 后端
+- `app/agent/state.py`: 新增 `orchestrator_event` 字段，task_orchestrator每次执行写入事件(plan/progress/complete)
+- `app/agent/graph.py`: task_orchestrator_node写入编排事件 — 首次推送plan(任务列表)，每次子意图完成推送progress(结果+进度)，全部完成推送complete
+- `app/api/chat.py`: SSE流中监听task_orchestrator的on_chain_end，推送3种SSE事件: `sub_intent_plan`(任务规划)、`sub_intent_progress`(子任务完成)、`sub_intent_complete`(全部完成)
+
+#### 前端
+- `app/static/index.html` CSS: 新增 `.task-plan` 进度卡片、`.task-item` 状态行(pending/running/done)、`.task-progress-bar` 进度条、`.task-result` 折叠展开动画
+- `app/static/index.html` JS: `renderTaskPlan()` 渲染任务列表、`updateTaskProgress()` 更新进度+折叠、`toggleTaskResult()` 展开/折叠切换
+- 子任务完成时自动展开1.5秒再折叠，用户可手动点击展开查看详细结果
+- 最终Agent回复不折叠，直接展示在任务卡片下方
+
+---
+
+## [2026-07-20] 多意图拆解 + 串行编排 — 支持长问题多子问题处理
+
+### 核心变更
+
+#### 架构: 单意图/多意图双路径
+- **单意图(80%场景)**: `intent_router → subAgent → response` — 原路径不变，零开销
+- **多意图(20%场景)**: `intent_router → task_orchestrator → subAgent → task_orchestrator → ... → response` — 串行编排循环
+
+#### 文件修改清单
+
+| 文件 | 修改 |
+|------|------|
+| `app/agent/schemas.py` | 新增 `SubIntent`(id/intent/depends_on/tool_hint) + `MultiIntentDecomposition`(intents/confidence/reasoning) |
+| `app/agent/state.py` | 新增 `sub_intents`/`current_sub_idx`/`sub_results` 3个字段 |
+| `app/agent/prompts.py` | 新增 `MULTI_INTENT_PROMPT` — 意图拆解Prompt，含拆解规则和示例 |
+| `app/agent/nodes/intent_router.py` | 重写：先MultiIntentDecomposition拆解→单意图走原路径→多意图走编排→拆解失败回退单意图 |
+| `app/agent/graph.py` | 新增 `task_orchestrator_node`(串行编排+结果收集)+`_route_after_agent_unified`(自动判断单/多意图) |
+| `app/agent/edges.py` | `route_by_intent`新增多意图优先级 + 新增`route_after_orchestrator`(编排后路由) |
+| `app/static/index.html` | node_start事件中展示"正在处理多个问题..."进度提示 |
+
+#### 关键设计决策
+
+1. **置信度阈值防误拆**: `MULTI_INTENT_CONFIDENCE_THRESHOLD=0.6`，低于阈值当单意图处理
+2. **串行而非并行**: DAG并行与LangGraph静态图冲突，串行+SSE流式输出用户感知不差
+3. **前序结果注入**: 后续子意图通过`[前序处理结果]`上下文获取前序子意图的输出
+4. **结果汇总**: 所有子意图完成后，结果注入`conversation_summary`供response节点汇总回复
+5. **单意图零开销**: sub_intents为空时完全走原路径，不影响80%的正常对话
+
+---
+
 ## [2026-07-20] HITL: 高风险操作人工确认机制
 
 ### 🔴 Critical新增

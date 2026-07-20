@@ -68,3 +68,18 @@ class CustomerServiceState(TypedDict):
 
     # 单次请求最大ReAct步数(超过强制进入response)
     max_react_steps: int
+
+    # === 多意图编排字段 ===
+
+    # 拆解后的子意图列表(为空表示单意图，走原路径)
+    sub_intents: list[dict]
+
+    # 当前执行到第几个子意图(0-based)
+    current_sub_idx: int
+
+    # 各子意图的执行结果(用于跨子意图信息传递)
+    sub_results: list[dict]
+
+    # 编排事件(供SSE消费，每次task_orchestrator执行后写入)
+    # 格式: {"type": "plan"|"progress"|"complete", ...}
+    orchestrator_event: Optional[dict]

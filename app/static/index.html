@@ -403,6 +403,109 @@
             color: var(--text-secondary);
             padding: 8px 0;
         }
+
+        /* === 多意图编排进度 === */
+        .task-plan {
+            margin: 8px 0;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        .task-plan-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: #eef2ff;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--primary);
+        }
+        .task-plan-header .task-count {
+            font-weight: 400;
+            color: var(--text-secondary);
+            font-size: 11px;
+        }
+        .task-progress-bar {
+            height: 3px;
+            background: var(--border);
+            position: relative;
+        }
+        .task-progress-bar .bar-fill {
+            height: 100%;
+            background: var(--primary);
+            transition: width 0.4s ease;
+            border-radius: 1px;
+        }
+        .task-item {
+            padding: 0 12px;
+            border-top: 1px solid var(--border);
+            transition: background 0.2s;
+        }
+        .task-item-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 0;
+            cursor: pointer;
+            user-select: none;
+        }
+        .task-item-header:hover { opacity: 0.8; }
+        .task-icon {
+            width: 20px; height: 20px;
+            border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 11px; flex-shrink: 0;
+            background: var(--ai-bg);
+            color: var(--text-secondary);
+        }
+        .task-item.pending .task-icon { background: var(--ai-bg); color: var(--text-secondary); }
+        .task-item.running .task-icon {
+            background: #dbeafe; color: #2563eb;
+            animation: pulse 1.5s ease infinite;
+        }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .task-item.done .task-icon { background: #dcfce7; color: #166534; }
+        .task-label {
+            flex: 1;
+            font-size: 13px;
+            color: var(--text);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .task-item.done .task-label { color: var(--text-secondary); }
+        .task-badge {
+            font-size: 10px;
+            padding: 1px 6px;
+            border-radius: 8px;
+            flex-shrink: 0;
+        }
+        .task-item.pending .task-badge { background: var(--ai-bg); color: var(--text-secondary); }
+        .task-item.running .task-badge { background: #dbeafe; color: #2563eb; }
+        .task-item.done .task-badge { background: #dcfce7; color: #166534; }
+        .task-toggle {
+            width: 16px; height: 16px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 10px; color: var(--text-secondary);
+            transition: transform 0.2s;
+            flex-shrink: 0;
+        }
+        .task-toggle.open { transform: rotate(90deg); }
+        .task-result {
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s ease, padding 0.3s ease;
+            font-size: 12px;
+            line-height: 1.6;
+            color: var(--text-secondary);
+            padding: 0 0;
+        }
+        .task-result.open {
+            max-height: 400px;
+            padding: 0 0 8px 28px;
+            overflow-y: auto;
+        }
     </style>
 </head>
 <body>
@@ -642,7 +745,36 @@
                                 }
                             });
                         } else if (eventType === 'node_start') {
-                            // Could show node progress if desired
+                            // 编排模式下子Agent开始 → 标记当前任务为running
+                            if (data.node && data.node !== 'intent_router' && data.node !== 'response' && data.node !== 'task_orchestrator') {
+                                const plan = bubble.querySelector('.task-plan');
+                                if (plan) {
+                                    const runningItem = plan.querySelector('.task-item.pending');
+                                    if (runningItem) {
+                                        runningItem.classList.remove('pending');
+                                        runningItem.classList.add('running');
+                                        runningItem.querySelector('.task-icon').textContent = '⟳';
+                                        runningItem.querySelector('.task-badge').textContent = '执行中';
+                                    }
+                                }
+                            }
+                        } else if (eventType === 'sub_intent_plan') {
+                            // 收到多意图规划 → 渲染任务列表
+                            if (!typingRemoved) {
+                                const typing = bubble.querySelector('.typing-indicator');
+                                if (typing) typing.remove();
+                                typingRemoved = true;
+                            }
+                            renderTaskPlan(bubble, data);
+                            scrollToBottom();
+                        } else if (eventType === 'sub_intent_progress') {
+                            // 子意图完成 → 更新状态 + 折叠上一个结果
+                            updateTaskProgress(bubble, data);
+                            scrollToBottom();
+                        } else if (eventType === 'sub_intent_complete') {
+                            // 所有子意图完成 → 进度条100%
+                            const bar = bubble.querySelector('.bar-fill');
+                            if (bar) bar.style.width = '100%';
                         } else if (eventType === 'interrupt') {
                             // HITL: 高风险操作需用户确认
                             if (!typingRemoved) {
@@ -907,6 +1039,115 @@
         delete window._hitlConfirmData;
         isStreaming = false;
         sendBtn.disabled = false;
+    }
+
+    // === 多意图编排: 渲染任务列表 ===
+    const HINT_LABELS = {
+        'order_query': '订单查询',
+        'product_search': '商品搜索',
+        'refund_service': '售后退款',
+        'knowledge_faq': '知识FAQ',
+        'human_escalation': '转人工',
+    };
+
+    function renderTaskPlan(bubble, planData) {
+        const { total, tasks } = planData;
+        const planDiv = document.createElement('div');
+        planDiv.className = 'task-plan';
+
+        // 标题栏
+        let headerHtml = `
+            <div class="task-plan-header">
+                📋 任务规划
+                <span class="task-count">共 ${total} 项</span>
+            </div>
+            <div class="task-progress-bar">
+                <div class="bar-fill" style="width: 0%"></div>
+            </div>
+        `;
+
+        // 任务项
+        let itemsHtml = '';
+        for (let i = 0; i < tasks.length; i++) {
+            const t = tasks[i];
+            const hintLabel = HINT_LABELS[t.tool_hint] || t.tool_hint;
+            itemsHtml += `
+                <div class="task-item pending" data-task-id="${t.id}" data-task-idx="${i}">
+                    <div class="task-item-header" onclick="toggleTaskResult(this)">
+                        <div class="task-icon">${i + 1}</div>
+                        <div class="task-label">${escapeHtml(t.intent)}</div>
+                        <div class="task-badge">${escapeHtml(hintLabel)}</div>
+                        <div class="task-toggle">▶</div>
+                    </div>
+                    <div class="task-result"></div>
+                </div>
+            `;
+        }
+
+        planDiv.innerHTML = headerHtml + itemsHtml;
+        bubble.appendChild(planDiv);
+    }
+
+    function updateTaskProgress(bubble, progressData) {
+        const { idx, total, task_id, task_intent, result_summary } = progressData;
+        const plan = bubble.querySelector('.task-plan');
+        if (!plan) return;
+
+        // 更新进度条
+        const percent = Math.round((idx / total) * 100);
+        const bar = plan.querySelector('.bar-fill');
+        if (bar) bar.style.width = percent + '%';
+
+        // 标记已完成的任务
+        const items = plan.querySelectorAll('.task-item');
+        items.forEach(item => {
+            const itemIdx = parseInt(item.dataset.taskIdx);
+            if (itemIdx < idx) {
+                // 已完成的任务
+                item.classList.remove('running', 'pending');
+                item.classList.add('done');
+                item.querySelector('.task-icon').textContent = '✓';
+                item.querySelector('.task-badge').textContent = '已完成';
+                item.querySelector('.task-toggle').style.display = '';
+
+                // 写入结果(如果还没有)
+                const resultDiv = item.querySelector('.task-result');
+                if (resultDiv && !resultDiv.dataset.filled) {
+                    resultDiv.textContent = result_summary || '处理完成';
+                    resultDiv.dataset.filled = '1';
+                    // 自动展开一下再折叠(给用户看到有结果)
+                    resultDiv.classList.add('open');
+                    item.querySelector('.task-toggle').classList.add('open');
+                    setTimeout(() => {
+                        // 1.5秒后自动折叠(如果用户没手动操作)
+                        if (!resultDiv.dataset.userToggled) {
+                            resultDiv.classList.remove('open');
+                            item.querySelector('.task-toggle').classList.remove('open');
+                        }
+                    }, 1500);
+                }
+            } else if (itemIdx === idx) {
+                // 下一个要执行的任务 → 标记为pending(会在node_start时改为running)
+                // 实际上idx位置的task是刚完成的，idx+1是下一个
+                // 不需要特殊处理，因为上面的itemIdx < idx已经覆盖
+            }
+        });
+    }
+
+    function toggleTaskResult(headerEl) {
+        const item = headerEl.parentElement;
+        const resultDiv = item.querySelector('.task-result');
+        const toggle = item.querySelector('.task-toggle');
+        if (!resultDiv || !resultDiv.dataset.filled) return; // 没有结果不可展开
+
+        resultDiv.dataset.userToggled = '1'; // 标记用户手动操作
+        if (resultDiv.classList.contains('open')) {
+            resultDiv.classList.remove('open');
+            toggle.classList.remove('open');
+        } else {
+            resultDiv.classList.add('open');
+            toggle.classList.add('open');
+        }
     }
 
     // Focus input on load

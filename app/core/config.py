@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = ""  # 必须设置，为空则启动crash
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 60 * 24 * 7  # Token有效期7天
-    AUTH_ENABLED: bool = True  # 认证开关(开发时可关闭)
+    AUTH_ENABLED: bool = False  # 认证开关(生产环境必须设为true)
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

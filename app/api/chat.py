@@ -162,13 +162,48 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
                             "data": json.dumps({"node": node_name}, ensure_ascii=False),
                         }
 
-                # 节点完成 — 捕获response节点的meta数据
+                # 节点完成 — 捕获response节点的meta数据 + task_orchestrator编排事件
                 elif kind == "on_chain_end":
                     node_name = event.get("name", "")
                     if node_name == "response":
                         output = event.get("data", {}).get("output", {})
                         if isinstance(output, dict) and output.get("response_meta"):
                             response_meta_data = output["response_meta"]
+
+                    # task_orchestrator编排事件 — 推送plan/progress/complete给前端
+                    if node_name == "task_orchestrator":
+                        output = event.get("data", {}).get("output", {})
+                        if isinstance(output, dict) and output.get("orchestrator_event"):
+                            evt = output["orchestrator_event"]
+                            last_event_time = asyncio.get_event_loop().time()
+                            if evt.get("type") == "plan":
+                                yield {
+                                    "event": "sub_intent_plan",
+                                    "data": json.dumps({
+                                        "total": evt["total"],
+                                        "tasks": evt["tasks"],
+                                    }, ensure_ascii=False),
+                                }
+                            elif evt.get("type") == "progress":
+                                yield {
+                                    "event": "sub_intent_progress",
+                                    "data": json.dumps({
+                                        "idx": evt["idx"],
+                                        "total": evt["total"],
+                                        "task_id": evt.get("task_id"),
+                                        "task_intent": evt.get("task_intent", ""),
+                                        "task_hint": evt.get("task_hint", ""),
+                                        "result_summary": evt.get("result_summary", ""),
+                                    }, ensure_ascii=False),
+                                }
+                            elif evt.get("type") == "complete":
+                                yield {
+                                    "event": "sub_intent_complete",
+                                    "data": json.dumps({
+                                        "total": evt["total"],
+                                        "results": evt.get("results", []),
+                                    }, ensure_ascii=False),
+                                }
 
                 # SSE心跳: 长时间无token输出时发ping，检测Ghost连接
                 now = asyncio.get_event_loop().time()

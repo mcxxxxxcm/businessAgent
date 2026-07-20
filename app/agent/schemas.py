@@ -13,7 +13,9 @@
 - Layer 4: schema_to_json_instruction + safe_parse_model — Prompt要求JSON+手动解析
 
 模型分类:
-- IntentClassification: 意图分类结果
+- IntentClassification: 意图分类结果(单意图，80%场景)
+- MultiIntentDecomposition: 多意图拆解结果(长问题，20%场景)
+- SubIntent: 拆解后的子意图单元
 - ConversationSummary: 对话摘要结构化输出
 - FactExtraction: 关键事实提取
 - AgentResponseMeta: 最终回复元数据(情感、建议动作)
@@ -53,6 +55,57 @@ class IntentClassification(BaseModel):
         ge=0.0,
         le=1.0,
         description="情感强度分数，0.0-1.0，angry时通常>0.8应自动转人工",
+    )
+
+
+# ============================================================
+# 多意图拆解
+# ============================================================
+
+class SubIntent(BaseModel):
+    """拆解后的子意图 — 最小不可分的操作单元
+
+    用于 MultiIntentDecomposition 中的每个子意图。
+    """
+    id: int = Field(
+        description="子意图编号，从1开始，按执行顺序排列",
+    )
+    intent: str = Field(
+        description="子意图的自然语言描述，如'查询蓝牙耳机订单'",
+    )
+    depends_on: list[int] = Field(
+        default_factory=list,
+        description="依赖的子意图ID列表，如[1]表示需要等id=1完成后再执行",
+    )
+    tool_hint: Literal[
+        "order_query",
+        "product_search",
+        "refund_service",
+        "knowledge_faq",
+        "human_escalation",
+    ] = Field(
+        description="建议路由到哪个子Agent处理",
+    )
+
+
+class MultiIntentDecomposition(BaseModel):
+    """多意图拆解结果 — 用于长问题/复合意图
+
+    当用户消息包含多个独立意图时，LLM输出此结构。
+    如果只有1个意图，走原有IntentClassification单意图路径(零开销)。
+    """
+    intents: list[SubIntent] = Field(
+        description="拆解后的子意图列表，按执行顺序排列",
+    )
+    confidence: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description="拆解置信度，低于0.6时当作单意图处理(防误拆)",
+    )
+    reasoning: str = Field(
+        default="",
+        description="拆解理由(调试用，不展示给用户)",
     )
 
 

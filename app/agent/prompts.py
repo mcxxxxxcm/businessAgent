@@ -194,6 +194,42 @@ INTENT_ROUTER_PROMPT = ChatPromptTemplate.from_messages([
     MessagesPlaceholder("history"),
 ])
 
+# --- 多意图拆解 Prompt ---
+MULTI_INTENT_INSTRUCTION = """你是一个电商客服意图拆解器。请分析用户消息，判断包含几个独立意图，并将每个意图拆解为原子操作。
+
+拆解规则:
+1. atomic: 每个子意图是最小不可分的操作单元(如"查订单"是原子的，"查订单并退款"不是)
+2. ordered: 按执行顺序排列，id从1开始
+3. dependent: 如果后续意图需要前序意图的输出(如需要先查到订单号才能退款)，在depends_on中标注
+4. tool_hint: 每个子意图建议路由到哪个子Agent
+
+tool_hint映射:
+- order_query: 查询订单、物流、配送
+- product_search: 搜索商品、库存、价格
+- refund_service: 退款、换货、售后工单
+- knowledge_faq: 政策咨询、FAQ
+- human_escalation: 转人工
+
+判断策略:
+- 如果用户消息只包含一个意图(如"查物流")，返回intents列表长度为1
+- 如果包含多个独立意图(如"换货+退款")，拆解为多个SubIntent
+- confidence: 拆解置信度，如果不确定是否应该拆解，给低值(如0.5)
+
+示例:
+用户: "蓝牙耳机到了但左耳没声音，想换货，顺便把手机壳也退了"
+拆解:
+  [{id:1, intent:"查询蓝牙耳机订单", depends_on:[], tool_hint:"order_query"},
+   {id:2, intent:"对蓝牙耳机申请换货(左耳无声音)", depends_on:[1], tool_hint:"refund_service"},
+   {id:3, intent:"对同订单手机壳申请退款", depends_on:[1], tool_hint:"refund_service"}]
+"""
+
+MULTI_INTENT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", BASE_ROLE),
+    ("system", MULTI_INTENT_INSTRUCTION),
+    ("system", MEMORY_CONTEXT_TEMPLATE),
+    MessagesPlaceholder("history"),
+])
+
 # --- 订单Agent Prompt ---
 ORDER_AGENT_PROMPT = ChatPromptTemplate.from_messages([
     ("system", BASE_ROLE + "\n\n当前用户ID: {user_id}\n当前会话ID: {session_id}"),
