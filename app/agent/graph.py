@@ -19,6 +19,11 @@ START → intent_router → [子Agent]
 1. 工具隔离: 子Agent只能调用自己绑定的工具，无法越权
 2. 错误容忍: handle_tool_errors=True，工具异常转为错误消息返回Agent
 3. 资源限制: ReAct循环步数限制，防止无限循环
+
+HITL(人工确认):
+- 高风险ToolNode在执行前自动中断(interrupt_before)，等待用户确认后才继续执行
+- 用户拒绝时，图收到Command(resume={"__approved__": False})，工具不执行，返回拒绝消息
+- 低风险ToolNode(只读查询)不需要确认，直接执行
 """
 
 from langgraph.graph import StateGraph, START, END
@@ -60,6 +65,22 @@ SUB_AGENTS = list(AGENT_TOOLS.keys())
 ALL_TOOLS = [t for tools in AGENT_TOOLS.values() for t in tools]
 
 MAX_TOOL_CALLS = 5  # 单次请求最大工具调用次数(双重保护)
+
+# === 高风险ToolNode列表 — 需要人工确认后才执行 ===
+# refund_agent: create_refund(创建退款), create_service_ticket(创建工单)
+# escalation: place_phone_call(外呼), send_custom_sms(自定义短信)
+HIGH_RISK_TOOL_NODES = [
+    "tool_executor_refund_agent",
+    "tool_executor_escalation",
+]
+
+# 高风险工具名称(用于前端展示确认信息)
+HIGH_RISK_TOOL_NAMES = {
+    "create_refund": "创建退款申请",
+    "create_service_ticket": "创建售后工单",
+    "place_phone_call": "拨打电话",
+    "send_custom_sms": "发送短信",
+}
 
 
 def build_graph() -> StateGraph:
@@ -198,10 +219,16 @@ def _route_after_tool(state: CustomerServiceState) -> str:
 
 
 async def compile_graph(checkpointer, store):
-    """编译图(带checkpointer和store)"""
+    """编译图(带checkpointer、store和HITL中断)
+
+    interrupt_before: 高风险ToolNode执行前暂停，等用户确认
+    - 确认: 调用graph.stream(Command(resume={"__approved__": True}), config)
+    - 拒绝: 调用graph.stream(Command(resume={"__approved__": False}), config)
+    """
     builder = build_graph()
     graph = builder.compile(
         checkpointer=checkpointer,
         store=store,
+        interrupt_before=HIGH_RISK_TOOL_NODES,
     )
     return graph

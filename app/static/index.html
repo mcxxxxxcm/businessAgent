@@ -316,6 +316,93 @@
         .chat-container::-webkit-scrollbar { width: 6px; }
         .chat-container::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
         .chat-container::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+        /* HITL: 高风险操作确认弹窗 */
+        .confirm-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            animation: fadeIn 0.2s ease;
+        }
+        .confirm-dialog {
+            background: var(--card);
+            border-radius: 16px;
+            padding: 24px;
+            max-width: 400px;
+            width: 90%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+        }
+        .confirm-dialog .confirm-icon {
+            font-size: 36px;
+            margin-bottom: 12px;
+            text-align: center;
+        }
+        .confirm-dialog .confirm-title {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            text-align: center;
+        }
+        .confirm-dialog .confirm-detail {
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+            line-height: 1.5;
+        }
+        .confirm-dialog .confirm-args {
+            background: var(--ai-bg);
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 12px;
+            color: var(--text);
+            margin-bottom: 16px;
+            max-height: 120px;
+            overflow-y: auto;
+            line-height: 1.5;
+        }
+        .confirm-dialog .confirm-args .arg-key {
+            color: var(--primary);
+            font-weight: 500;
+        }
+        .confirm-dialog .confirm-buttons {
+            display: flex;
+            gap: 10px;
+        }
+        .confirm-dialog .confirm-buttons button {
+            flex: 1;
+            padding: 10px 16px;
+            border-radius: 10px;
+            border: none;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .confirm-dialog .btn-reject {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+        .confirm-dialog .btn-reject:hover { background: #fecaca; }
+        .confirm-dialog .btn-confirm {
+            background: var(--primary);
+            color: white;
+        }
+        .confirm-dialog .btn-confirm:hover { background: var(--primary-light); }
+        .confirm-dialog .btn-confirm:disabled,
+        .confirm-dialog .btn-reject:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .confirm-dialog .confirm-waiting {
+            text-align: center;
+            font-size: 13px;
+            color: var(--text-secondary);
+            padding: 8px 0;
+        }
     </style>
 </head>
 <body>
@@ -556,6 +643,14 @@
                             });
                         } else if (eventType === 'node_start') {
                             // Could show node progress if desired
+                        } else if (eventType === 'interrupt') {
+                            // HITL: 高风险操作需用户确认
+                            if (!typingRemoved) {
+                                const typing = bubble.querySelector('.typing-indicator');
+                                if (typing) typing.remove();
+                                typingRemoved = true;
+                            }
+                            showConfirmDialog(data, bubble);
                         } else if (eventType === 'error') {
                             if (!typingRemoved) {
                                 const typing = bubble.querySelector('.typing-indicator');
@@ -679,6 +774,139 @@
             buttons.forEach(b => b.disabled = false);
             btnEl.classList.remove('selected');
         }
+    }
+
+    // === HITL: 高风险操作确认弹窗 ===
+    function showConfirmDialog(interruptData, bubble) {
+        const { session_id, tool_name, tool_display_name, tool_args, message } = interruptData;
+
+        // 在AI消息气泡中显示等待提示
+        const waitDiv = document.createElement('div');
+        waitDiv.className = 'tool-status';
+        waitDiv.id = 'hitl-wait-' + Date.now();
+        waitDiv.innerHTML = `⏳ 等待确认: ${escapeHtml(tool_display_name || tool_name)}...`;
+        bubble.appendChild(waitDiv);
+        scrollToBottom();
+
+        // 构建参数展示HTML
+        let argsHtml = '';
+        if (tool_args && Object.keys(tool_args).length > 0) {
+            const argLabels = {
+                'order_id': '订单号', 'reason': '原因', 'refund_type': '退款类型',
+                'items': '商品', 'issue_type': '问题类型', 'description': '描述',
+                'priority': '优先级', 'phone_number': '手机号', 'content': '内容',
+            };
+            for (const [key, value] of Object.entries(tool_args)) {
+                const label = argLabels[key] || key;
+                const displayValue = key === 'phone_number' ? value.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2') : value;
+                argsHtml += `<span class="arg-key">${escapeHtml(label)}</span>: ${escapeHtml(String(displayValue))}<br>`;
+            }
+        }
+
+        // 创建确认弹窗
+        const overlay = document.createElement('div');
+        overlay.className = 'confirm-overlay';
+        overlay.id = 'confirm-overlay';
+        overlay.innerHTML = `
+            <div class="confirm-dialog">
+                <div class="confirm-icon">⚠️</div>
+                <div class="confirm-title">操作确认</div>
+                <div class="confirm-detail">${escapeHtml(message || '即将执行高风险操作，请确认是否继续？')}</div>
+                ${argsHtml ? `<div class="confirm-args">${argsHtml}</div>` : ''}
+                <div class="confirm-buttons">
+                    <button class="btn-reject" onclick="handleToolConfirm(false)">取消操作</button>
+                    <button class="btn-confirm" onclick="handleToolConfirm(true)">确认执行</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        // 存储确认所需数据
+        window._hitlConfirmData = {
+            sessionId: session_id,
+            bubble: bubble,
+            waitDiv: waitDiv,
+            overlay: overlay,
+            toolDisplayName: tool_display_name || tool_name,
+        };
+    }
+
+    async function handleToolConfirm(approved) {
+        const data = window._hitlConfirmData;
+        if (!data) return;
+
+        const { sessionId, bubble, waitDiv, overlay, toolDisplayName } = data;
+
+        // 禁用按钮，显示处理中
+        const buttons = overlay.querySelectorAll('button');
+        buttons.forEach(b => b.disabled = true);
+        const btnContainer = overlay.querySelector('.confirm-buttons');
+        btnContainer.innerHTML = '<div class="confirm-waiting">处理中...</div>';
+
+        try {
+            const response = await fetch('/api/v1/chat/confirm', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    session_id: sessionId,
+                    approved: approved,
+                }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`请求失败: ${response.status}`);
+            }
+
+            const result = await response.json();
+
+            // 关闭弹窗
+            overlay.remove();
+
+            // 更新等待状态
+            if (waitDiv && waitDiv.parentElement) {
+                if (result.status === 'confirmed') {
+                    waitDiv.classList.add('done');
+                    waitDiv.innerHTML = `✓ ${escapeHtml(toolDisplayName)} 已执行`;
+                } else if (result.status === 'rejected') {
+                    waitDiv.classList.add('error');
+                    waitDiv.innerHTML = `✕ ${escapeHtml(toolDisplayName)} 已取消`;
+                } else {
+                    waitDiv.innerHTML = escapeHtml(result.message || '处理完成');
+                }
+            }
+
+            // 追加操作结果提示
+            if (result.status === 'confirmed') {
+                const resultDiv = document.createElement('div');
+                resultDiv.style.cssText = 'margin-top:6px;font-size:12px;color:var(--success);';
+                resultDiv.textContent = '操作已确认执行';
+                bubble.appendChild(resultDiv);
+            } else if (result.status === 'rejected') {
+                const resultDiv = document.createElement('div');
+                resultDiv.style.cssText = 'margin-top:6px;font-size:12px;color:#ef4444;';
+                resultDiv.textContent = '操作已取消';
+                bubble.appendChild(resultDiv);
+            }
+
+            scrollToBottom();
+        } catch (err) {
+            console.error('确认操作失败:', err);
+            // 恢复按钮
+            const btnContainer = overlay.querySelector('.confirm-buttons') || overlay.querySelector('.confirm-dialog');
+            if (btnContainer) {
+                btnContainer.innerHTML = `
+                    <div class="confirm-buttons">
+                        <button class="btn-reject" onclick="handleToolConfirm(false)">取消操作</button>
+                        <button class="btn-confirm" onclick="handleToolConfirm(true)">确认执行</button>
+                    </div>
+                `;
+            }
+        }
+
+        // 清理
+        delete window._hitlConfirmData;
+        isStreaming = false;
+        sendBtn.disabled = false;
     }
 
     // Focus input on load

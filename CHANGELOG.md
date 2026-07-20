@@ -1,5 +1,37 @@
 # CHANGELOG
 
+## [2026-07-20] HITL: 高风险操作人工确认机制
+
+### 🔴 Critical新增
+
+#### 高风险工具执行前需用户确认(interrupt_before)
+- **修改**: `app/agent/graph.py` — `compile_graph()`新增`interrupt_before=HIGH_RISK_TOOL_NODES`，图编译时对`tool_executor_refund_agent`和`tool_executor_escalation`设置执行前中断
+- **修改**: `app/agent/graph.py` — 新增`HIGH_RISK_TOOL_NODES`和`HIGH_RISK_TOOL_NAMES`常量，定义需确认的ToolNode和高风险工具中文名
+- **修改**: `app/api/chat.py` — SSE流结束后检查图`aget_state`是否因interrupt暂停，是则推送`interrupt`事件(含工具名、参数、确认消息)给前端
+- **新增**: `POST /api/v1/chat/confirm` — 用户确认/拒绝接口，使用`Command(resume)`恢复图执行
+  - 确认: `Command(resume={"__approved__": True})` → 工具正常执行
+  - 拒绝: `Command(resume=ToolMessage(content=拒绝消息))` → Agent收到拒绝反馈，告知用户操作已取消
+- **修改**: `app/static/index.html` — 新增确认弹窗UI(参数展示+确认/取消按钮)，处理SSE`interrupt`事件，调用`/chat/confirm`接口
+
+#### 高风险工具清单
+| 工具 | 风险级别 | 需确认 | 原因 |
+|------|---------|--------|------|
+| `create_refund` | 高 | ✅ | 创建退款申请，不可逆操作 |
+| `create_service_ticket` | 高 | ✅ | 创建售后工单，触发人工流程 |
+| `place_phone_call` | 高 | ✅ | 拨打电话，骚扰风险 |
+| `send_custom_sms` | 高 | ✅ | 发送自定义短信，垃圾短信风险 |
+| `query_order` | 低 | ❌ | 只读查询 |
+| `track_logistics` | 低 | ❌ | 只读查询 |
+| `search_products` | 低 | ❌ | 只读查询 |
+| `check_inventory` | 低 | ❌ | 只读查询 |
+| `query_refund_status` | 低 | ❌ | 只读查询 |
+| `send_order_notification` | 中 | ❌ | 模板短信，内容可控 |
+| `send_refund_notification` | 中 | ❌ | 模板短信，内容可控 |
+| `search_knowledge_base` | 低 | ❌ | 只读查询 |
+| `transfer_to_human` | 低 | ❌ | 转人工是用户意图 |
+
+---
+
 ## [2026-07-12] 深度安全审查修复 — 认证/PII/XSS/供应链
 
 ### 🔴 Critical修复

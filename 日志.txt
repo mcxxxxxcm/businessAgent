@@ -1,0 +1,337 @@
+好问题。我把 s01-s20 学到的机制，结合电商客服的实际场景，设计一个完整的方案。
+
+---
+
+# 电商客服长问题处理方案
+
+## 一、什么是"长问题"？
+
+电商客服场景中，"长问题"不是"字数多的问题"，而是**需要多步操作、跨系统查询、或者涉及多种意图的问题**：
+
+| 类型 | 示例 | 涉及系统 |
+|------|------|---------|
+| **多意图复合** | "我昨天买的那个蓝牙耳机到了但左耳没声音，我想换货，顺便把同订单的手机壳也退了" | 订单 + 换货 + 退款 |
+| **多步流程** | "帮我查一下订单 12345 的物流，如果已经到北京了就改收货地址" | 物流 + 地址修改 |
+| **条件分支** | "这个商品有货吗？有的话我用之前那张优惠券买两件" | 库存 + 优惠券 + 下单 |
+| **跨轮累积** | "我上周问过那个退款，现在怎么样了" | 退款 + 历史对话 |
+
+---
+
+## 二、整体架构
+
+```
+用户长问题
+  ↓
+[意图拆解层] — s05 TodoWrite 思路
+  ↓
+[任务编排层] — s12 DAG 思路
+  ↓
+[执行隔离层] — s06 Subagent 思路
+  ↓
+[上下文管理层] — s08 Compact + s09 Memory 思路
+  ↓
+[错误恢复层] — s11 Error Recovery 思路
+```
+
+---
+
+## 三、第一层：意图拆解（对应 s05）
+
+### 3.1 问题：用户一句话包含多个意图
+
+> "我昨天买的那个蓝牙耳机到了但左耳没声音，我想换货，顺便把同订单的手机壳也退了"
+
+这句话包含 **3 个意图**：
+1. 查订单（找到昨天的蓝牙耳机订单）
+2. 申请换货（蓝牙耳机左耳没声音）
+3. 申请退款（同订单的手机壳）
+
+### 3.2 实现：意图拆解器
+
+```python
+INTENT_SECTIONS = {
+    "decompose": """你是电商客服的意图拆解器。
+将用户消息拆解为独立的子意图。每个子意图必须：
+- atomic：不可再分的最小操作单元
+- ordered：按执行顺序排列
+- dependent：标注依赖关系（哪个意图的输出是另一个的输入）
+
+返回 JSON 数组，每项：{id, intent, depends_on, tool_hint}
+tool_hint 是建议使用的工具类型。""",
+}
+
+def decompose(user_message: str, context: dict) -> list[dict]:
+    """用 LLM 拆解用户意图，返回有序子意图列表。"""
+    # 类似 s09 的 side-query — 独立 LLM 调用
+    prompt = INTENT_SECTIONS["decompose"] + f"\n\n用户消息：{user_message}"
+    response = client.messages.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1000,
+    )
+    items = parse_json_array(response)  # 解析 JSON 数组
+    
+    # 防御性校验（s05 的 _normalize_todos 思路）
+    for item in items:
+        item.setdefault("depends_on", [])
+        item.setdefault("tool_hint", "generic")
+    return items
+```
+
+**拆解结果**：
+
+```json
+[
+  {"id": 1, "intent": "查询昨天购买的蓝牙耳机订单", "depends_on": [], "tool_hint": "order_query"},
+  {"id": 2, "intent": "对蓝牙耳机申请换货（左耳无声音）", "depends_on": [1], "tool_hint": "exchange"},
+  {"id": 3, "intent": "对同订单的手机壳申请退款", "depends_on": [1], "tool_hint": "refund"}
+]
+```
+
+**关键**：意图 2 和 3 都依赖意图 1（需要先知道订单号才能换货/退款），但 2 和 3 之间互不依赖。
+
+---
+
+## 四、第二层：任务编排（对应 s12 DAG）
+
+### 4.1 构建 DAG
+
+```python
+class TaskDAG:
+    """任务依赖图 — s12 思路"""
+    
+    def __init__(self, intents: list[dict]):
+        self.tasks = {}
+        for intent in intents:
+            self.tasks[intent["id"]] = {
+                "id": intent["id"],
+                "intent": intent["intent"],
+                "tool_hint": intent["tool_hint"],
+                "status": "pending",        # pending / ready / running / done / failed
+                "depends_on": intent["depends_on"],
+                "result": None,
+            }
+        self._update_ready()
+    
+    def _update_ready(self):
+        """依赖都完成的任务变为 ready"""
+        for task in self.tasks.values():
+            if task["status"] != "pending":
+                continue
+            if all(self.tasks[d]["status"] == "done" for d in task["depends_on"]):
+                task["status"] = "ready"
+    
+    def get_ready_tasks(self) -> list[dict]:
+        """返回所有可执行的任务（依赖已完成）"""
+        return [t for t in self.tasks.values() if t["status"] == "ready"]
+    
+    def mark_done(self, task_id, result):
+        self.tasks[task_id]["status"] = "done"
+        self.tasks[task_id]["result"] = result
+        self._update_ready()   # 可能解锁后续任务
+    
+    def mark_failed(self, task_id, error):
+        self.tasks[task_id]["status"] = "failed"
+        self.tasks[task_id]["result"] = error
+```
+
+### 4.2 DAG 驱动的执行流程
+
+```
+初始状态:
+  Task 1 (查订单)    → pending, depends_on=[]
+  Task 2 (换货)      → pending, depends_on=[1]
+  Task 3 (退款)      → pending, depends_on=[1]
+
+执行 Task 1:
+  → 调 order_query → 返回 {order_id: "ORD-20240105-123", items: [...]}
+  → mark_done(1) → Task 2, 3 变为 ready
+
+并行执行 Task 2 和 Task 3（互不依赖）:
+  → 调 exchange(order_id="ORD-20240105-123", item="蓝牙耳机", reason="左耳无声音")
+  → 调 refund(order_id="ORD-20240105-123", item="手机壳")
+
+汇总结果 → 回复用户
+```
+
+---
+
+## 五、第三层：执行隔离（对应 s06 Subagent）
+
+### 5.1 每个子意图用独立 Subagent 执行
+
+```python
+def execute_task(task: dict, shared_context: dict) -> str:
+    """执行单个子意图 — s06 的 spawn_subagent 思路"""
+    
+    # 全新 messages — 上下文隔离
+    messages = [{
+        "role": "user",
+        "content": f"执行以下客服操作：{task['intent']}\n\n已知信息：{json.dumps(shared_context, ensure_ascii=False)}"
+    }]
+    
+    # 限制子 Agent 的工具 — 只给相关的
+    tools = get_tools_for_hint(task["tool_hint"])
+    
+    for _ in range(10):  # 安全限制
+        response = client.messages.create(
+            model=MODEL, system=SUB_SYSTEM, messages=messages, tools=tools, max_tokens=4000)
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            break
+        # ... 工具执行 ...
+    
+    return extract_text(messages[-1]["content"])  # 只返回结论
+```
+
+### 5.2 工具分组——按意图类型分配
+
+| tool_hint | 可用工具 | 说明 |
+|-----------|---------|------|
+| `order_query` | query_order, query_order_items | 只查不改 |
+| `exchange` | query_order, create_exchange, query_exchange_status | 可查可改 |
+| `refund` | query_order, create_refund, query_refund_status | 可查可改 |
+| `logistics` | query_logistics, modify_address | 物流相关 |
+| `coupon` | query_coupon, apply_coupon | 优惠券相关 |
+
+**为什么限制工具？** s06 的核心——子 Agent 只看到和任务相关的工具，减少幻觉和误操作。
+
+### 5.3 shared_context — 跨任务信息传递
+
+```python
+shared_context = {}
+
+# Task 1 完成
+result_1 = execute_task(task_1, shared_context)
+shared_context.update({
+    "order_id": result_1["order_id"],
+    "items": result_1["items"],
+})
+
+# Task 2 执行时，shared_context 中已有 order_id
+result_2 = execute_task(task_2, shared_context)
+```
+
+**Task 1 的结论通过 `shared_context` 传给 Task 2**——和 s06 的 "只回传结论" 一致。Task 2 看到的是 `{"order_id": "ORD-...", "items": [...]}`，不需要看 Task 1 的中间查询过程。
+
+---
+
+## 六、第四层：上下文管理（对应 s08 + s09）
+
+### 6.1 s08 压缩——客服对话通常很长
+
+客服对话可能持续几十轮（用户反复问、查、确认）。工具输出（订单详情、物流信息）很大但时效短。
+
+**策略**：
+
+```python
+# micro_compact 保留最近 3 条 tool_result
+# 订单详情、物流信息在用完后被占位符替换
+# 用户需要时可以重新查询（"Re-run if needed"）
+
+# tool_result_budget: 大结果落盘
+# 完整订单详情写入 .task_outputs/tool-results/
+# 上下文只留预览
+```
+
+### 6.2 s09 记忆——跨会话记住用户信息
+
+```python
+# 自动提取的记忆类型：
+MEMORY_TYPES = ["user", "feedback", "project", "reference"]
+
+# 客服场景下的四类记忆：
+# user:     "用户偏好短信通知" / "用户是 VIP 等级"
+# feedback: "用户之前投诉过物流慢" / "用户倾向在线退款而非退到银行卡"
+# project:  "用户当前有进行中的换货工单 EXC-789"
+# reference: "用户的常用收货地址是北京市朝阳区..."
+```
+
+**跨会话场景**：
+
+```
+会话 1: 用户说"我上次买的蓝牙耳机有问题"
+  → extract_memories → 写入 user-bluetooth-earphone-issue.md
+
+会话 2（3天后）: 用户说"那个退款怎么样了"
+  → load_memories → 找到 user-bluetooth-earphone-issue.md
+  → 注入记忆 → 模型知道"用户之前买的蓝牙耳机有问题"
+  → 不需要用户重复描述问题
+```
+
+---
+
+## 七、第五层：错误恢复（对应 s11）
+
+客服场景常见错误：
+
+| 错误 | 恢复策略 |
+|------|---------|
+| 订单系统超时 | 重试 + 降级（"系统繁忙，请稍后再试"） |
+| 退款金额计算失败 | 换路径（手动计算 → 让用户确认） |
+| 换货商品无库存 | 条件分支（建议用户选其他颜色/型号） |
+| API 限流 429 | 指数退避重试 |
+
+---
+
+## 八、完整流程图
+
+```
+用户: "蓝牙耳机到了但左耳没声音，想换货，顺便把手机壳也退了"
+  │
+  ├─ [意图拆解] decompose()
+  │    → [{1: 查订单}, {2: 换货, depends: [1]}, {3: 退款, depends: [1]}]
+  │
+  ├─ [DAG 构建] TaskDAG(intents)
+  │    → Task 1: ready, Task 2: pending, Task 3: pending
+  │
+  ├─ [执行 Task 1] execute_task(查订单, shared_context={})
+  │    → spawn_subagent → 调 query_order → 返回 order_id + items
+  │    → shared_context = {order_id: "ORD-123", items: [蓝牙耳机, 手机壳]}
+  │    → DAG: Task 2: ready, Task 3: ready
+  │
+  ├─ [并行执行 Task 2, 3]
+  │    ├─ execute_task(换货, shared_context) → 调 create_exchange → EXC-456
+  │    └─ execute_task(退款, shared_context) → 调 create_refund → REF-789
+  │
+  ├─ [汇总] compose_response()
+  │    → "已为您处理：1) 蓝牙耳机换货工单 EXC-456 2) 手机壳退款工单 REF-789"
+  │
+  └─ [记忆提取] extract_memories()
+       → 写入 user-bluetooth-earphone-exchange.md（下次问到能关联）
+```
+
+---
+
+## 九、方案关键设计决策
+
+| 决策 | 选择 | 原因 |
+|------|------|------|
+| 拆解谁做？ | LLM side-query | 客服意图拆解需要理解自然语言，规则引擎覆盖不全 |
+| 拆解粒度？ | atomic 意图 | 最小不可分单元，保证 DAG 可编排 |
+| 执行隔离？ | Subagent | 不同意图的上下文互不污染（查订单的中间过程不影响换货） |
+| 信息传递？ | shared_context | 子任务间通过结论传递，不传中间过程 |
+| 并发策略？ | DAG 驱动 | 无依赖的意图并行执行，缩短响应时间 |
+| 权限控制？ | 按意图类型限制工具 | 查询意图不给修改工具，防止误操作 |
+| 长对话管理？ | micro_compact + 落盘 | 订单详情时效短，用完可丢 |
+| 跨会话？ | Memory 自动提取 | 用户偏好/历史工单自动记忆，无需重复描述 |
+
+---
+
+## 十、和传统客服系统的对比
+
+| 维度 | 传统规则引擎 | 本方案（Agent 架构） |
+|------|-------------|-------------------|
+| 意图识别 | 正则/关键词匹配 | LLM 语义理解 |
+| 多意图 | 优先级排序，只处理第一个 | 全部拆解，DAG 编排 |
+| 条件分支 | if-else 硬编码 | LLM 推理 + DAG 动态分支 |
+| 跨系统 | 预先集成，硬调 API | 按需调工具，Subagent 隔离 |
+| 错误处理 | 跳转人工 | 自动重试/换路径/降级 |
+| 跨会话 | 数据库存用户画像 | Memory 文件 + 自动提取 |
+| 扩展新场景 | 加规则 + 加代码 | 加工具 + 加 section |
+
+**核心差异**：传统方案是"穷举所有分支"，Agent 方案是"让模型自己推理分支"。前者在已知场景下稳定，后者在未知场景下灵活。
+
+---
+
+需要我把这个方案落到代码上吗？还是继续学 s11？
