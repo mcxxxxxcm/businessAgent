@@ -1,0 +1,18 @@
+=== test_startup.py 开始 2026-07-21T00:30:09.187885 ===
+[00:30:09.194] Python: 3.11.15 | packaged by Anaconda, Inc. | (main, Jun 11 2026, 15:12:53) [MSC v.1942 64 bit (AMD64)]
+[00:30:09.201] Event loop policy: WindowsSelectorEventLoopPolicy
+[00:30:09.210] === 测试1: get_graph() 异步初始化 ===
+[00:30:20.762]   get_graph 已导入
+[00:30:22.205]   get_graph() OK: CompiledStateGraph
+[00:30:22.217]   graph.nodes = ['__start__', 'intent_router', 'task_orchestrator', 'order_agent', 'product_agent', 'refund_agent', 'knowledge_agent', 'escalation', 'response', 'summarize', 'tool_executor_order_agent', 'tool_executor_product_agent', 'tool_executor_refund_agent', 'tool_executor_knowledge_agent', 'tool_executor_escalation']
+[00:30:22.226]   单例验证: 同一对象 ✓
+[00:30:22.236] === 测试1: 通过 ===
+
+[00:30:22.247] === 测试2: uvicorn 服务启动 ===
+[00:30:22.258]   启动 uvicorn 子进程...
+[00:30:22.287]   等待服务就绪 (最多60秒)...
+[00:31:23.159]   服务未能在60秒内就绪 (已等61秒)
+[00:31:23.190] === 测试2: 失败 ===
+
+[00:31:23.199] ==================================================
+[00:31:23.208] get_graph() 通过, 但服务启动失败

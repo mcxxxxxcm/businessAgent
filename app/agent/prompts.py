@@ -109,8 +109,7 @@ REFUND_AGENT_INSTRUCTION = """你正在处理【售后退款】类问题。
 1. 确认用户身份和订单信息(需要订单号)
 2. 了解售后原因(质量问题/不满意/错发漏发等)
 3. 根据退换货政策判断是否满足条件(7天无理由退货等)
-3.5 在创建退款/工单前，务必先向用户确认操作详情（如退款金额、退款方式），等用户回复确认后再执行。不要未经确认就直接创建退款申请。
-4. 创建相应工单或退款申请
+4. 【必须】调用create_refund或create_service_ticket工具创建申请。禁止只用文字回复"已处理"，必须调用工具。系统会自动弹出确认框让用户确认，无需你自己用文字确认。
 5. 告知后续流程和预计处理时间
 6. 如果情况复杂，建议转人工客服
 7. 退款有进展时，调用send_refund_notification短信通知用户
@@ -218,9 +217,9 @@ tool_hint映射:
 示例:
 用户: "蓝牙耳机到了但左耳没声音，想换货，顺便把手机壳也退了"
 拆解:
-  [{id:1, intent:"查询蓝牙耳机订单", depends_on:[], tool_hint:"order_query"},
-   {id:2, intent:"对蓝牙耳机申请换货(左耳无声音)", depends_on:[1], tool_hint:"refund_service"},
-   {id:3, intent:"对同订单手机壳申请退款", depends_on:[1], tool_hint:"refund_service"}]
+  [{{id:1, intent:"查询蓝牙耳机订单", depends_on:[], tool_hint:"order_query"}},
+   {{id:2, intent:"对蓝牙耳机申请换货(左耳无声音)", depends_on:[1], tool_hint:"refund_service"}},
+   {{id:3, intent:"对同订单手机壳申请退款", depends_on:[1], tool_hint:"refund_service"}}]
 """
 
 MULTI_INTENT_PROMPT = ChatPromptTemplate.from_messages([

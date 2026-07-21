@@ -1,5 +1,6 @@
 """应用配置管理 - 基于 Pydantic Settings"""
 
+from pathlib import Path
 from pydantic_settings import BaseSettings
 
 
@@ -79,7 +80,11 @@ class Settings(BaseSettings):
     JWT_EXPIRE_MINUTES: int = 60 * 24 * 7  # Token有效期7天
     AUTH_ENABLED: bool = False  # 认证开关(生产环境必须设为true)
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+    model_config = {
+        "env_file": str(Path(__file__).resolve().parent.parent.parent / ".env"),
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",
+    }
 
 
 settings = Settings()

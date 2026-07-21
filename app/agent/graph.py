@@ -119,15 +119,20 @@ HINT_TO_AGENT = {
 async def task_orchestrator_node(state: CustomerServiceState) -> dict:
     """串行编排节点：按依赖顺序逐个执行子意图
 
-    核心逻辑:
-    1. 如果是子Agent执行后回到此节点(current_sub_idx对应的子意图已有AI回复)→先收集结果
-    2. 收集完毕后推进current_sub_idx
-    3. 检查下一个子意图，构造消息注入对应子Agent
-    4. 如果全部子意图已执行完毕，不更新state，route_after_orchestrator路由到response
+    事件协议(驱动前端手风琴折叠):
+    - plan: 任务规划列表(首次进入时)
+    - subtask_start: 子任务开始执行(前端展开当前,折叠之前)
+    - subtask_end: 子任务完成(前端折叠当前,显示摘要)
     """
     sub_intents = state.get("sub_intents", [])
     current_idx = state.get("current_sub_idx", 0)
     sub_results = list(state.get("sub_results", []))
+    orchestrator_event = None
+
+    logger.info(
+        "task_orchestrator: state check — sub_intents=%d, current_idx=%d, sub_results=%d",
+        len(sub_intents), current_idx, len(sub_results),
+    )
 
     # === 步骤1: 收集上一个子意图的执行结果 ===
     if len(sub_results) < current_idx and current_idx > 0:
@@ -138,8 +143,9 @@ async def task_orchestrator_node(state: CustomerServiceState) -> dict:
                 last_ai_content = msg.content
                 break
 
-        summary = last_ai_content[:300] if len(last_ai_content) > 300 else last_ai_content
+        summary = last_ai_content[:200] if len(last_ai_content) > 200 else last_ai_content
         prev_task = sub_intents[current_idx - 1]
+        prev_id = f"st_{prev_task.get('id', current_idx):03d}"
         completed_result = {
             "id": prev_task.get("id", current_idx),
             "intent": prev_task.get("intent", ""),
@@ -153,18 +159,13 @@ async def task_orchestrator_node(state: CustomerServiceState) -> dict:
             current_idx, len(last_ai_content),
         )
 
-        # 推送 progress 事件: 子意图完成
-        progress_event = {
-            "type": "progress",
-            "idx": current_idx,           # 已完成的子意图序号(1-based)
-            "total": len(sub_intents),
-            "task_id": completed_result["id"],
-            "task_intent": completed_result["intent"],
-            "task_hint": completed_result["tool_hint"],
-            "result_summary": summary,
+        # 推送 subtask_end 事件: 子任务完成
+        orchestrator_event = {
+            "type": "subtask_end",
+            "id": prev_id,
+            "status": "success",
+            "summary": summary,
         }
-    else:
-        progress_event = None
 
     # === 步骤2: 检查是否全部执行完毕 ===
     if current_idx >= len(sub_intents):
@@ -173,21 +174,29 @@ async def task_orchestrator_node(state: CustomerServiceState) -> dict:
             f"- {r.get('intent', '?')}: {r.get('summary', '')}"
             for r in sub_results
         )
-        return {
+        result = {
             "sub_results": sub_results,
             "conversation_summary": f"[多意图处理结果]\n{all_summaries}",
-            "orchestrator_event": {
-                "type": "complete",
-                "total": len(sub_intents),
-                "results": [{"id": r["id"], "intent": r["intent"], "summary": r["summary"]} for r in sub_results],
-            },
+            "active_agent": None,  # 清空：信号所有子意图已完成，route_after_orchestrator→response
         }
+        # 编码事件(支持多个事件)
+        events = []
+        if orchestrator_event:
+            events.append(orchestrator_event)
+        if events:
+            result["orchestrator_event"] = events[0] if len(events) == 1 else {
+                "type": "multi_event",
+                "events": events,
+            }
+        return result
 
     # === 步骤3: 准备下一个子意图 ===
     current_task = sub_intents[current_idx]
     task_id = current_task.get("id", current_idx + 1)
     task_intent = current_task.get("intent", "")
     tool_hint = current_task.get("tool_hint", "general_chat")
+    subtask_id = f"st_{task_id:03d}"
+    target_agent = HINT_TO_AGENT.get(tool_hint, "")
 
     # 构造子意图的执行消息
     context_parts = []
@@ -204,28 +213,56 @@ async def task_orchestrator_node(state: CustomerServiceState) -> dict:
     if context_text:
         sub_message_content += f"\n\n[前序处理结果]\n{context_text}"
 
-    target_agent = HINT_TO_AGENT.get(tool_hint, "")
-
     logger.info(
         "task_orchestrator: 执行子意图 %d/%d (id=%d, hint=%s, agent=%s): %s",
         current_idx + 1, len(sub_intents), task_id, tool_hint, target_agent, task_intent[:50],
     )
 
-    # 首次进入编排时(current_idx==0且sub_results为空)推送 plan 事件
-    if current_idx == 0 and not sub_results:
-        orchestrator_event = {
+    # 构造事件: 首次推送plan, 每次推送subtask_start
+    events = []
+    # Plan条件: 检查是否已经有plan事件被发送过
+    # 使用更可靠的条件: current_idx=0 且 sub_results为空
+    # 如果checkpoint残留导致条件不满足，也尝试生成plan(幂等，前端会忽略重复plan)
+    should_generate_plan = (current_idx == 0 and not sub_results)
+    # Fallback: 如果current_idx>0但sub_results为空，说明state被重置但idx没归零
+    if not should_generate_plan and not sub_results and current_idx <= len(sub_intents):
+        logger.warning(
+            "task_orchestrator: plan条件fallback — current_idx=%d(应为0), sub_results=%d, 强制生成plan",
+            current_idx, len(sub_results),
+        )
+        should_generate_plan = True
+    logger.info(
+        "task_orchestrator: plan条件检查 — current_idx=%d, sub_results=%d, should_plan=%s",
+        current_idx, len(sub_results), should_generate_plan,
+    )
+    if should_generate_plan:
+        # 首次进入编排 → 推送任务规划列表
+        logger.info("task_orchestrator: 生成plan事件 (current_idx=%d, sub_results=%s)", current_idx, sub_results)
+        events.append({
             "type": "plan",
             "total": len(sub_intents),
             "tasks": [
                 {"id": t.get("id", i + 1), "intent": t.get("intent", ""), "tool_hint": t.get("tool_hint", "")}
                 for i, t in enumerate(sub_intents)
             ],
-        }
-    elif progress_event:
-        orchestrator_event = progress_event
+        })
     else:
-        orchestrator_event = None
+        logger.info("task_orchestrator: 跳过plan (current_idx=%d, sub_results=%d, sub_intents=%d)", current_idx, len(sub_results), len(sub_intents))
+    if orchestrator_event:
+        events.append(orchestrator_event)
+    # 推送 subtask_start: 子任务开始执行
+    events.append({
+        "type": "subtask_start",
+        "id": subtask_id,
+        "title": task_intent,
+        "agent": target_agent,
+        # Debug: 传递状态信息用于诊断
+        "_debug_current_idx": current_idx,
+        "_debug_sub_results_count": len(sub_results),
+    })
 
+    # 合并事件 — 使用orchestrator_event字段(state schema中定义)
+    # 多个事件时编码为multi_event包装，chat.py解析后逐个发送SSE
     result = {
         "messages": [HumanMessage(content=sub_message_content)],
         "active_agent": target_agent,
@@ -233,8 +270,15 @@ async def task_orchestrator_node(state: CustomerServiceState) -> dict:
         "current_sub_idx": current_idx + 1,
         "sub_results": sub_results,
     }
-    if orchestrator_event:
-        result["orchestrator_event"] = orchestrator_event
+    logger.info("task_orchestrator: events列表长度=%d, types=%s", len(events), [e.get("type") for e in events])
+    if len(events) == 1:
+        result["orchestrator_event"] = events[0]
+    elif len(events) > 1:
+        # 多事件编码为multi_event — orchestrator_events不在state schema中会被LangGraph过滤
+        result["orchestrator_event"] = {
+            "type": "multi_event",
+            "events": events,
+        }
     return result
 
 

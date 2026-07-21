@@ -92,6 +92,10 @@ async def intent_router_node(state: CustomerServiceState, *, store: BaseStore) -
         semaphore=llm_semaphore,
     )
 
+    # Fallback: structured_output失败时，用直接LLM调用+手动JSON解析
+    if multi_result is None:
+        multi_result = await _direct_multi_intent_detect(llm, recent_messages, llm_semaphore)
+
     # 将画像数据存入state，供后续节点使用
     profile_dict = profile.model_dump() if profile else {}
     base_updates = {
@@ -206,3 +210,98 @@ async def intent_router_node(state: CustomerServiceState, *, store: BaseStore) -
         "sub_results": [],
         **base_updates,
     }
+
+
+async def _direct_multi_intent_detect(llm, messages, semaphore) -> MultiIntentDecomposition | None:
+    """直接LLM调用+手动JSON解析 — structured_output失败时的fallback
+
+    用简化的prompt要求LLM返回JSON，避免嵌套Schema的structured output问题。
+    适用于glm-4-flash等对复杂structured output支持不佳的模型。
+    """
+    import asyncio
+    import json
+    import re
+    from langchain_core.messages import SystemMessage, HumanMessage
+    from app.agent.schemas import SubIntent
+
+    # 提取用户最新消息
+    user_msg = ""
+    for msg in reversed(messages):
+        if hasattr(msg, "type") and msg.type == "human":
+            user_msg = msg.content
+            break
+    if not user_msg:
+        return None
+
+    system_prompt = """你是电商客服意图拆解器。分析用户消息，判断包含几个独立意图，返回JSON。
+
+规则:
+1. 每个子意图是最小不可分操作(如"退款"是原子的，"退款并推荐"不是)
+2. id从1开始，按执行顺序排列
+3. tool_hint映射: 查订单/物流→order_query, 搜索/推荐商品→product_search, 退款/换货→refund_service, 政策/FAQ→knowledge_faq, 转人工→human_escalation
+4. 单意图时intents长度为1
+5. confidence: 拆解置信度(0-1)，不确定时给低值
+
+必须严格返回JSON，不要其他内容:
+{"intents": [{"id": 1, "intent": "意图描述", "tool_hint": "类型"}], "confidence": 0.9}"""
+
+    try:
+        async def _call():
+            if semaphore:
+                async with semaphore:
+                    return await llm.ainvoke(
+                        [SystemMessage(content=system_prompt), HumanMessage(content=user_msg)],
+                        config={"tags": ["internal"]},
+                    )
+            return await llm.ainvoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=user_msg)],
+                config={"tags": ["internal"]},
+            )
+
+        response = await asyncio.wait_for(_call(), timeout=15.0)
+        content = getattr(response, "content", "")
+
+        # 提取JSON
+        json_match = re.search(r"\{[\s\S]*\}", content)
+        if not json_match:
+            logger.warning("direct_multi_intent: 无JSON找到, content=%s", content[:200])
+            return None
+
+        data = json.loads(json_match.group(0))
+        intents_data = data.get("intents", [])
+        if not intents_data:
+            return None
+
+        # 构造SubIntent列表
+        sub_intents = []
+        for item in intents_data:
+            tool_hint = item.get("tool_hint", "order_query")
+            # 校验tool_hint合法性
+            valid_hints = {"order_query", "product_search", "refund_service", "knowledge_faq", "human_escalation"}
+            if tool_hint not in valid_hints:
+                tool_hint = "order_query"
+            sub_intents.append(SubIntent(
+                id=item.get("id", len(sub_intents) + 1),
+                intent=item.get("intent", ""),
+                depends_on=item.get("depends_on", []),
+                tool_hint=tool_hint,
+            ))
+
+        confidence = data.get("confidence", 0.8)
+        result = MultiIntentDecomposition(
+            intents=sub_intents,
+            confidence=confidence,
+            reasoning="direct_llm_fallback",
+        )
+        logger.info(
+            "direct_multi_intent: 成功拆解%d个意图, confidence=%.2f",
+            len(sub_intents), confidence,
+        )
+        return result
+
+    except asyncio.TimeoutError:
+        logger.warning("direct_multi_intent: 超时(15s)")
+        return None
+    except Exception as e:
+        logger.warning("direct_multi_intent: 失败: %s", e)
+        return None

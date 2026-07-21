@@ -50,30 +50,20 @@ def route_by_intent(state: dict) -> str:
 def route_after_orchestrator(state: dict) -> str:
     """task_orchestrator执行后路由: 还有没有子意图要处理?
 
+    使用active_agent字段路由(task_orchestrator已设置)，
+    完成时active_agent被清空，路由到response。
+
     返回值:
     - 子Agent节点名: 继续执行下一个子意图
     - "response": 所有子意图已执行完，进入回复汇总
     """
-    sub_intents = state.get("sub_intents", [])
-    current_idx = state.get("current_sub_idx", 0)
+    # task_orchestrator准备子意图时设置active_agent，完成时清空
+    active_agent = state.get("active_agent")
+    if active_agent:
+        return active_agent
 
-    if current_idx >= len(sub_intents):
-        # 全部执行完毕 → 进入response汇总
-        return "response"
-
-    # 还有子意图要处理 → 路由到对应子Agent
-    current_task = sub_intents[current_idx]
-    tool_hint = current_task.get("tool_hint", "general_chat")
-
-    hint_to_node = {
-        "order_query": "order_agent",
-        "product_search": "product_agent",
-        "refund_service": "refund_agent",
-        "knowledge_faq": "knowledge_agent",
-        "human_escalation": "escalation",
-    }
-
-    return hint_to_node.get(tool_hint, "response")
+    # 无active_agent = 所有子意图已完成 → 进入response汇总
+    return "response"
 
 
 def route_after_sub_agent_in_orchestration(state: dict) -> str:

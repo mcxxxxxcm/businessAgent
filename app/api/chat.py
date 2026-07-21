@@ -77,6 +77,10 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
             "response_meta": None,
             "react_step_count": 0,
             "max_react_steps": settings.MAX_REACT_STEPS,
+            "sub_intents": [],
+            "current_sub_idx": 0,
+            "sub_results": [],
+            "orchestrator_event": None,
         }
 
         # 更新用户在线状态
@@ -89,130 +93,190 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
         }
 
         try:
-            # 使用astream_events v3 API获取Token级流式输出
-            # 同时跟踪response_meta用于流结束时推送
+            # 使用graph.stream()支持interrupt_before暂停
+            # stream_mode=["messages", "updates"]:
+            #   messages: LLM token级流式输出 (chunk, metadata)
+            #   updates: 节点输出更新 {node_name: output_dict}
+            # 关键: stream()会在interrupt_before节点前暂停，astream_events不会!
             response_meta_data = None
             last_event_time = asyncio.get_event_loop().time()
+            current_subtask_id = None
+            is_orchestration_mode = False
+            last_known_subtask_id = None
+            current_running_node = None
 
-            async for event in graph.astream_events(
+            SUB_AGENT_NODE_NAMES = {"order_agent", "product_agent", "refund_agent", "knowledge_agent", "escalation"}
+            TRACKED_NODES = {
+                "intent_router", "order_agent", "product_agent", "refund_agent",
+                "knowledge_agent", "escalation", "response", "task_orchestrator",
+            }
+
+            async for event in graph.astream(
                 input_data,
                 config=config,
+                stream_mode=["messages", "updates"],
                 version="v2",
             ):
-                kind = event.get("event")
+                # version="v2" yields dict: {"type": "messages"|"updates", "ns": tuple, "data": payload}
+                if not isinstance(event, dict):
+                    continue
+                stream_mode = event.get("type", "")
+                data = event.get("data")
 
-                # LLM生成Token — 过滤内部调用(意图路由JSON等)，只放行用户可见的回复
-                if kind == "on_chat_model_stream":
-                    tags = event.get("tags", [])
-                    # 排除标记为internal的LLM调用(意图路由等)
+                # === messages模式: LLM token级流式 ===
+                if stream_mode == "messages":
+                    # data = (chunk, metadata)
+                    if not isinstance(data, tuple) or len(data) != 2:
+                        continue
+                    chunk, metadata = data
+
+                    # 过滤internal标记的LLM调用
+                    tags = metadata.get("tags", []) if isinstance(metadata, dict) else []
                     if "internal" in tags:
                         continue
 
-                    chunk = event["data"]["chunk"]
-                    if hasattr(chunk, "content") and chunk.content:
-                        if isinstance(chunk.content, str):
-                            last_event_time = asyncio.get_event_loop().time()
-                            yield {
-                                "event": "token",
-                                "data": json.dumps({"content": chunk.content}, ensure_ascii=False),
-                            }
+                    content = getattr(chunk, "content", None)
+                    if not content:
+                        continue
+                    # 处理content为list的情况(智谱API返回 [{"type":"text","text":"..."}])
+                    if isinstance(content, list):
+                        text_parts = []
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text_parts.append(item.get("text", ""))
+                            elif isinstance(item, str):
+                                text_parts.append(item)
+                        content = "".join(text_parts)
+                    if isinstance(content, str) and content:
+                        last_event_time = asyncio.get_event_loop().time()
 
-                # 工具调用开始
-                elif kind == "on_tool_start":
-                    tool_name = event.get("name", "unknown")
-                    last_event_time = asyncio.get_event_loop().time()
-                    yield {
-                        "event": "tool_start",
-                        "data": json.dumps(
-                            {"tool": tool_name, "message": f"正在调用 {tool_name}..."},
-                            ensure_ascii=False,
-                        ),
-                    }
+                        # === 判断subtask_stream vs final_stream ===
+                        use_subtask_stream = False
+                        sub_id = current_subtask_id
 
-                # 工具调用完成
-                elif kind == "on_tool_end":
-                    tool_name = event.get("name", "unknown")
-                    # 检查工具是否返回错误
-                    output = event.get("data", {}).get("output", "")
-                    is_error = hasattr(output, "status") and getattr(output, "status", "") == "error"
-                    last_event_time = asyncio.get_event_loop().time()
-                    yield {
-                        "event": "tool_end",
-                        "data": json.dumps({
-                            "tool": tool_name,
-                            "status": "error" if is_error else "completed",
-                        }, ensure_ascii=False),
-                    }
+                        if current_subtask_id:
+                            use_subtask_stream = True
+                        elif is_orchestration_mode:
+                            langgraph_node = metadata.get("langgraph_node", "") if isinstance(metadata, dict) else ""
+                            is_sub_agent = (
+                                (current_running_node in SUB_AGENT_NODE_NAMES)
+                                or (langgraph_node in SUB_AGENT_NODE_NAMES)
+                            )
+                            if is_sub_agent:
+                                use_subtask_stream = True
+                                sub_id = last_known_subtask_id
 
-                # 节点执行
-                elif kind == "on_chain_start":
-                    node_name = event.get("name", "")
-                    tracked_nodes = {
-                        "intent_router",
-                        "order_agent",
-                        "product_agent",
-                        "refund_agent",
-                        "knowledge_agent",
-                        "escalation",
-                        "response",
-                    }
-                    if node_name in tracked_nodes:
+                        evt_name = "subtask_stream" if use_subtask_stream else "final_stream"
+                        logger.info(
+                            "SSE %s: sub_id=%s, running_node=%s, orchestration=%s, len=%d",
+                            evt_name, sub_id, current_running_node, is_orchestration_mode, len(content),
+                        )
                         yield {
-                            "event": "node_start",
-                            "data": json.dumps({"node": node_name}, ensure_ascii=False),
+                            "event": evt_name,
+                            "data": json.dumps(
+                                {"id": sub_id, "content": content} if sub_id
+                                else {"content": content},
+                                ensure_ascii=False,
+                            ),
                         }
 
-                # 节点完成 — 捕获response节点的meta数据 + task_orchestrator编排事件
-                elif kind == "on_chain_end":
-                    node_name = event.get("name", "")
-                    if node_name == "response":
-                        output = event.get("data", {}).get("output", {})
-                        if isinstance(output, dict) and output.get("response_meta"):
+                # === updates模式: 节点输出更新 ===
+                elif stream_mode == "updates":
+                    # data = {node_name: output_dict}
+                    if not isinstance(data, dict):
+                        continue
+                    for node_name, output in data.items():
+                        if not isinstance(output, dict):
+                            continue
+
+                        # 节点开始通知
+                        if node_name in TRACKED_NODES:
+                            current_running_node = node_name
+                            logger.info("node_update: node=%s (orchestration=%s)", node_name, is_orchestration_mode)
+                            yield {
+                                "event": "node_start",
+                                "data": json.dumps({"node": node_name}, ensure_ascii=False),
+                            }
+
+                        # response节点的meta数据
+                        if node_name == "response" and output.get("response_meta"):
                             response_meta_data = output["response_meta"]
 
-                    # task_orchestrator编排事件 — 推送plan/progress/complete给前端
-                    if node_name == "task_orchestrator":
-                        output = event.get("data", {}).get("output", {})
-                        if isinstance(output, dict) and output.get("orchestrator_event"):
-                            evt = output["orchestrator_event"]
-                            last_event_time = asyncio.get_event_loop().time()
-                            if evt.get("type") == "plan":
-                                yield {
-                                    "event": "sub_intent_plan",
-                                    "data": json.dumps({
-                                        "total": evt["total"],
-                                        "tasks": evt["tasks"],
-                                    }, ensure_ascii=False),
-                                }
-                            elif evt.get("type") == "progress":
-                                yield {
-                                    "event": "sub_intent_progress",
-                                    "data": json.dumps({
-                                        "idx": evt["idx"],
-                                        "total": evt["total"],
-                                        "task_id": evt.get("task_id"),
-                                        "task_intent": evt.get("task_intent", ""),
-                                        "task_hint": evt.get("task_hint", ""),
-                                        "result_summary": evt.get("result_summary", ""),
-                                    }, ensure_ascii=False),
-                                }
-                            elif evt.get("type") == "complete":
-                                yield {
-                                    "event": "sub_intent_complete",
-                                    "data": json.dumps({
-                                        "total": evt["total"],
-                                        "results": evt.get("results", []),
-                                    }, ensure_ascii=False),
-                                }
+                        # tool_executor节点 → 工具调用通知
+                        if node_name.startswith("tool_executor_"):
+                            # 从output中提取工具调用信息
+                            messages_out = output.get("messages", [])
+                            for msg in messages_out:
+                                if hasattr(msg, "type") and msg.type == "tool":
+                                    tool_name = getattr(msg, "name", "unknown")
+                                    last_event_time = asyncio.get_event_loop().time()
+                                    is_error = hasattr(msg, "status") and getattr(msg, "status", "") == "error"
+                                    yield {
+                                        "event": "tool_end",
+                                        "data": json.dumps({
+                                            "tool": tool_name,
+                                            "status": "error" if is_error else "completed",
+                                        }, ensure_ascii=False),
+                                    }
 
-                # SSE心跳: 长时间无token输出时发ping，检测Ghost连接
+                        # task_orchestrator编排事件
+                        if node_name in ("task_orchestrator", "task_orchestrator_node"):
+                            # 解析事件: 支持multi_event包装和单事件
+                            evt_raw = output.get("orchestrator_event")
+                            if evt_raw and isinstance(evt_raw, dict) and evt_raw.get("type") == "multi_event":
+                                evts = evt_raw.get("events", [])
+                            elif evt_raw:
+                                evts = [evt_raw]
+                            else:
+                                evts = []
+
+                            for evt in evts:
+                                if not isinstance(evt, dict):
+                                    continue
+                                evt_type = evt.get("type")
+                                last_event_time = asyncio.get_event_loop().time()
+                                logger.info("orchestrator event: type=%s, keys=%s", evt_type, list(evt.keys()))
+
+                                if evt_type == "subtask_start":
+                                    current_subtask_id = evt["id"]
+                                    last_known_subtask_id = evt["id"]
+                                    yield {
+                                        "event": "subtask_start",
+                                        "data": json.dumps({
+                                            "id": evt["id"],
+                                            "title": evt.get("title", ""),
+                                            "agent": evt.get("agent", ""),
+                                        }, ensure_ascii=False),
+                                    }
+                                elif evt_type == "subtask_end":
+                                    current_subtask_id = None
+                                    yield {
+                                        "event": "subtask_end",
+                                        "data": json.dumps({
+                                            "id": evt["id"],
+                                            "status": evt.get("status", "success"),
+                                            "summary": evt.get("summary", ""),
+                                        }, ensure_ascii=False),
+                                    }
+                                elif evt_type == "plan":
+                                    is_orchestration_mode = True
+                                    yield {
+                                        "event": "subtask_plan",
+                                        "data": json.dumps({
+                                            "total": evt["total"],
+                                            "tasks": evt["tasks"],
+                                        }, ensure_ascii=False),
+                                    }
+
+                # SSE心跳
                 now = asyncio.get_event_loop().time()
                 if now - last_event_time > settings.SSE_PING_INTERVAL:
                     last_event_time = now
                     yield {"event": "ping", "data": ""}
 
         except Exception as e:
-            logger.error("流式生成失败: %s", e)
+            import traceback
+            logger.error("流式生成失败: %s\n%s", e, traceback.format_exc())
             yield {
                 "event": "error",
                 "data": json.dumps({"error": f"生成回复时出错: {str(e)}"}, ensure_ascii=False),
@@ -220,45 +284,56 @@ async def chat_stream(request: ChatRequest) -> EventSourceResponse:
 
         # === HITL: 检查图是否因interrupt而暂停 ===
         try:
+            from app.agent.graph import HIGH_RISK_TOOL_NODES
             state_snapshot = await graph.aget_state(config)
-            if state_snapshot.tasks:
-                # 有未完成的任务 — 检查是否是interrupt
+            next_nodes = state_snapshot.next or ()
+            logger.info(
+                "HITL检查: tasks=%d, next=%s",
+                len(state_snapshot.tasks) if state_snapshot.tasks else 0,
+                next_nodes,
+            )
+            # 判断interrupt: next指向高风险ToolNode 或 task有interrupts
+            is_interrupt = False
+            # 方式1: LangGraph 1.x — next指向interrupt_before的节点
+            if any(n in HIGH_RISK_TOOL_NODES for n in next_nodes):
+                is_interrupt = True
+            # 方式2: 旧版 — task.interrupts非空
+            if not is_interrupt and state_snapshot.tasks:
                 for task in state_snapshot.tasks:
                     if hasattr(task, "interrupts") and task.interrupts:
-                        # 图因interrupt暂停 — 推送确认请求给前端
-                        # 提取待调用的工具信息
-                        tool_calls = []
-                        if hasattr(task, "name") and task.name:
-                            tool_calls.append(task.name)
-                        # 从state的最后一条AI消息中提取tool_calls详情
-                        messages = state_snapshot.values.get("messages", [])
-                        tool_name = ""
-                        tool_args = {}
-                        if messages:
-                            last_msg = messages[-1]
-                            if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                                tc = last_msg.tool_calls[0]
-                                tool_name = tc.get("name", "")
-                                tool_args = tc.get("args", {})
+                        is_interrupt = True
+                        break
 
-                        tool_cn = HIGH_RISK_TOOL_NAMES.get(tool_name, tool_name or "高风险操作")
+            if is_interrupt:
+                # 图因interrupt暂停 — 推送确认请求给前端
+                messages = state_snapshot.values.get("messages", [])
+                tool_name = ""
+                tool_args = {}
+                if messages:
+                    last_msg = messages[-1]
+                    if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                        tc = last_msg.tool_calls[0]
+                        tool_name = tc.get("name", "")
+                        tool_args = tc.get("args", {})
 
-                        logger.info(
-                            "HITL interrupt: session=%s, tool=%s, 等待用户确认",
-                            session_id, tool_name,
-                        )
-                        yield {
-                            "event": "interrupt",
-                            "data": json.dumps({
-                                "session_id": session_id,
-                                "tool_name": tool_name,
-                                "tool_display_name": tool_cn,
-                                "tool_args": tool_args,
-                                "message": f"即将执行: {tool_cn}，请确认是否继续？",
-                            }, ensure_ascii=False),
-                        }
-                        # 流暂停，等待用户确认后再恢复(通过 /chat/confirm 接口)
-                        return
+                tool_cn = HIGH_RISK_TOOL_NAMES.get(tool_name, tool_name or "高风险操作")
+
+                logger.info(
+                    "HITL interrupt: session=%s, tool=%s, next=%s, 等待用户确认",
+                    session_id, tool_name, next_nodes,
+                )
+                yield {
+                    "event": "interrupt",
+                    "data": json.dumps({
+                        "session_id": session_id,
+                        "tool_name": tool_name,
+                        "tool_display_name": tool_cn,
+                        "tool_args": tool_args,
+                        "message": f"即将执行: {tool_cn}，请确认是否继续？",
+                    }, ensure_ascii=False),
+                }
+                # 流暂停，等待用户确认后再恢复(通过 /chat/confirm 接口)
+                return
         except Exception as e:
             logger.warning("HITL状态检查失败(不影响已输出内容): %s", e)
 
@@ -402,13 +477,21 @@ async def confirm_tool_execution(request: ToolConfirmRequest) -> ToolConfirmResp
         return ToolConfirmResponse(status="error", message="获取会话状态失败")
 
     # 验证是否真的有interrupt
+    # 方式1: LangGraph 1.x — next指向interrupt_before的节点
     has_interrupt = False
-    interrupted_task = None
-    for task in (state_snapshot.tasks or []):
-        if hasattr(task, "interrupts") and task.interrupts:
+    next_nodes = state_snapshot.next or ()
+    try:
+        from app.agent.graph import HIGH_RISK_TOOL_NODES
+        if any(n in HIGH_RISK_TOOL_NODES for n in next_nodes):
             has_interrupt = True
-            interrupted_task = task
-            break
+    except ImportError:
+        pass
+    # 方式2: 旧版 — task.interrupts非空
+    if not has_interrupt:
+        for task in (state_snapshot.tasks or []):
+            if hasattr(task, "interrupts") and task.interrupts:
+                has_interrupt = True
+                break
 
     if not has_interrupt:
         return ToolConfirmResponse(

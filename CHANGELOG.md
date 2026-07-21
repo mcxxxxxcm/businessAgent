@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## [2026-07-20] 自动手风琴折叠UI — 重构SSE事件协议
+
+### 核心改动
+- SSE事件协议重构: `token` → `final_stream`, 新增 `subtask_start`/`subtask_stream`/`subtask_end`
+- 前端状态驱动: 收到`subtask_start`自动折叠之前任务+展开当前, `subtask_end`折叠当前+显示摘要
+- 子任务流式内容: 子Agent的LLM token通过`subtask_stream`事件追加到对应子任务卡片内
+- 最终回复独立渲染: `final_stream`事件追加到`.text-area`区域,不覆盖子任务面板
+
+### 后端
+- `app/api/chat.py`: 事件协议重构, 新增`current_subtask_id`状态追踪区分subtask/final
+- `app/agent/graph.py`: `task_orchestrator_node`输出`subtask_start`/`subtask_end`事件替代`progress`/`complete`
+
+### 前端
+- `app/static/index.html`: 新增`handleSubtaskStart`/`handleSubtaskStream`/`handleSubtaskEnd`函数
+- `app/static/index.html`: 删除旧的`updateTaskProgress`/`toggleTaskResult`/`node_start`处理
+- CSS优化: 删除进度条,新增error状态样式,子任务卡片hover效果
+
+---
+
+## [2026-07-20] Bug修复 — llm_semaphore未导入 + Prompt花括号转义 + 退款Prompt
+
+### 修复
+- `app/agent/nodes/response.py`: _extract_response_meta中补导llm_semaphore(NameError)
+- `app/agent/prompts.py`: MULTI_INTENT_INSTRUCTION中JSON示例花括号双写转义({{id:1}})
+- `app/agent/prompts.py`: REFUND_AGENT_INSTRUCTION改为"直接调用create_refund工具，系统自动弹出确认框"，避免LLM文字拒绝
+- `app/api/chat.py`: input_data补sub_intents/current_sub_idx/sub_results初始值
+- `app/api/chat.py`: on_chat_model_stream增加防御性content解析(list/dict/str)
+- `app/api/chat.py`: 错误日志增加完整traceback
+
+---
+
 ## [2026-07-20] 多意图编排动态进度条 + 折叠展开子任务结果
 
 ### 新增

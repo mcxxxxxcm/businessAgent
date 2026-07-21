@@ -111,7 +111,7 @@ async def _extract_response_meta(ai_message, state: CustomerServiceState) -> dic
     Layer 4: JSON Prompt + 手动解析
     失败时使用规则推断兜底。
     """
-    from app.api.deps import get_llm, acquire_llm_semaphore, release_llm_semaphore, LLMQueueTimeoutError
+    from app.api.deps import get_llm, acquire_llm_semaphore, release_llm_semaphore, LLMQueueTimeoutError, llm_semaphore
     from app.agent.schemas import AgentResponseMeta, structured_llm_output
 
     content = ai_message.content if hasattr(ai_message, "content") and ai_message.content else ""
